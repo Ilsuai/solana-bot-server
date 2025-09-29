@@ -1,201 +1,167 @@
-import { 
-    Connection, 
-    Keypair, 
-    VersionedTransaction,
-    PublicKey, 
-} from '@solana/web3.js';
-import { 
-    createJupiterApiClient, 
-    QuoteResponse, 
-    SwapRequest 
-} from '@jup-ag/api';
-import { getMint } from '@solana/spl-token'; 
-import * as dotenv from 'dotenv';
-import { logTradeToFirestore, managePosition } from './firebaseAdmin';
-import bs58 from 'bs58';
+// server/tradeExecutor.ts
+// Executes swaps on Solana via Jupiter v6 (Quote + Swap).
+// Exports:
+//   - executeSwap({ fromMint, toMint, amount, slippageBps? })
+//   - buyToken({ mint, amountSol })
+//   - sellToken({ mint, amountTokens })
 
-dotenv.config();
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  VersionedTransaction,
+  ParsedAccountData,
+} from "@solana/web3.js";
+import fetch from "node-fetch";
+import bs58 from "bs58";
 
-const SOL_MINT = 'So11111111111111111111111111111111111111112'; 
+const SOL_MINT = "So11111111111111111111111111111111111111112"; // wSOL
+const JUP_BASE = process.env.JUPITER_BASE_URL || "https://quote-api.jup.ag";
+const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
-const WALLET_PRIVATE_KEY = process.env.PRIVATE_KEY;
-if (!WALLET_PRIVATE_KEY) {
-    throw new Error("PRIVATE_KEY is missing from the .env file.");
-}
-const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
-const walletPublicKey = walletKeypair.publicKey;
+const L = {
+  info: (s: string, m: string, meta?: any) =>
+    console.log(`🟦 [executor:${s}] ${m}`, meta ?? ""),
+  warn: (s: string, m: string, meta?: any) =>
+    console.warn(`🟨 [executor:${s}] ${m}`, meta ?? ""),
+  error: (s: string, m: string, meta?: any) =>
+    console.error(`🟥 [executor:${s}] ${m}`, meta ?? ""),
+};
 
-const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
-if (!rpcUrl) {
-    throw new Error("SOLANA_RPC_ENDPOINT is missing in the .env file.");
-}
+// -------- wallet loading --------
+function loadKeypair(): Keypair {
+  const b58 = process.env.WALLET_PRIVATE_KEY_B58;
+  const json = process.env.WALLET_PRIVATE_KEY_JSON;
 
-const connection = new Connection(rpcUrl, 'confirmed');
-
-// Explicitly set the Jupiter API to the v6 Mainnet endpoint
-const jupiterApi = createJupiterApiClient({
-  basePath: "https://quote-api.jup.ag/v6"
-});
-
-// Aggressive priority fee strategy
-async function getPriorityFee(): Promise<number> {
-    const minFee = 25000; // A reliable minimum fee (0.000025 SOL)
-    const maxFee = 1000000; // A sane maximum to avoid overpaying (0.001 SOL)
-
-    try {
-        const prioritizationFees = await connection.getRecentPrioritizationFees();
-        if (prioritizationFees.length === 0) {
-            console.log("[Fee] No recent priority fees found, using minimum.");
-            return minFee;
-        }
-
-        const recentFees = prioritizationFees
-            .map(fee => fee.prioritizationFee)
-            .filter(fee => fee <= maxFee);
-
-        if (recentFees.length === 0) {
-            console.log("[Fee] No recent fees within a reasonable range, using minimum.");
-            return minFee;
-        }
-
-        recentFees.sort((a, b) => a - b);
-        
-        const percentileIndex = Math.floor(recentFees.length * 0.95);
-        const aggressiveFee = recentFees[percentileIndex];
-        
-        const boostedFee = aggressiveFee + 1;
-        const finalFee = Math.max(boostedFee, minFee);
-
-        console.log(`[Fee] Aggressive fee (95th percentile + 1): ${finalFee} microLamports`);
-        return finalFee;
-
-    } catch (error) {
-        console.error("[Fee] Failed to get dynamic priority fee, using minimum.", error);
-        return minFee;
-    }
+  if (b58) {
+    const secret = bs58.decode(b58);
+    return Keypair.fromSecretKey(secret);
+  }
+  if (json) {
+    const arr = JSON.parse(json);
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+  throw new Error("Missing wallet secret. Set WALLET_PRIVATE_KEY_B58 or WALLET_PRIVATE_KEY_JSON.");
 }
 
-async function getTokenDecimals(mintAddress: string): Promise<number> {
-    if (mintAddress === SOL_MINT) return 9;
-    try {
-        const mintPublicKey = new PublicKey(mintAddress);
-        const mintInfo = await getMint(connection, mintPublicKey);
-        return mintInfo.decimals;
-    } catch (error) {
-        throw new Error(`Could not determine decimals for token ${mintAddress}.`);
-    }
+const connection = new Connection(RPC_URL, "confirmed");
+const wallet = loadKeypair();
+L.info("init", "Loaded wallet", { pubkey: wallet.publicKey.toBase58(), rpc: RPC_URL });
+
+// -------- helpers --------
+async function getMintDecimals(mintStr: string): Promise<number> {
+  if (mintStr === SOL_MINT) return 9;
+  const mint = new PublicKey(mintStr);
+  const acct = await connection.getParsedAccountInfo(mint, "confirmed");
+  const parsed = acct.value?.data as ParsedAccountData | undefined;
+  const decimals = parsed?.parsed?.info?.decimals;
+  if (typeof decimals === "number") return decimals;
+  L.warn("decimals", "Fallback to 9 decimals", { mint: mintStr });
+  return 9;
 }
 
-async function handleTradeSignal(signal: { token_address: string, action: string, amount_input: number }): Promise<{ signature: string, quote: QuoteResponse }> {
-    const { token_address, action, amount_input } = signal;
-    const slippageBps = 350; // 3.5% Slippage
-    const isBuy = action.toUpperCase() === 'BUY';
-    
-    const inputMint = isBuy ? SOL_MINT : token_address;
-    const outputMint = isBuy ? token_address : SOL_MINT;
-    
-    const inputTokenDecimals = await getTokenDecimals(inputMint);
-    const amountInSmallestUnits = Math.round(amount_input * Math.pow(10, inputTokenDecimals));
-    
-    if (amountInSmallestUnits <= 0) throw new Error(`Invalid amount: ${amount_input}`);
-
-    console.log(`[Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
-
-    const dynamicPriorityFee = await getPriorityFee();
-
-    const quote: QuoteResponse = await jupiterApi.quoteGet({
-        inputMint,
-        outputMint,
-        amount: amountInSmallestUnits, 
-        slippageBps,
-        onlyDirectRoutes: false, 
-    });
-
-    if (!quote) throw new Error('Failed to get a valid quote from Jupiter.');
-
-    const { swapTransaction, lastValidBlockHeight } = await jupiterApi.swapPost({
-        swapRequest: {
-            quoteResponse: quote,
-            userPublicKey: walletKeypair.publicKey.toBase58(),
-            wrapUnwrapSol: true, 
-            computeUnitPriceMicroLamports: dynamicPriorityFee,
-        } as SwapRequest
-    });
-
-    const transactionBuffer = Buffer.from(swapTransaction, 'base64');
-    let transaction = VersionedTransaction.deserialize(transactionBuffer);
-    
-    transaction.sign([walletKeypair]);
-    console.log('[Executor] Transaction signed. Sending...');
-
-    const rawTransaction = transaction.serialize();
-    const txSignature = await connection.sendRawTransaction(rawTransaction, {
-        skipPreflight: true, 
-        maxRetries: 2,
-    });
-
-    await connection.confirmTransaction({
-        blockhash: transaction.message.recentBlockhash,
-        lastValidBlockHeight: lastValidBlockHeight,
-        signature: txSignature
-    }, 'confirmed');
-
-    console.log(`[Executor] ✅ Trade Confirmed! Signature: ${txSignature}`);
-    
-    return { signature: txSignature, quote };
+function toMinorUnits(amount: number, decimals: number): string {
+  const factor = Math.pow(10, decimals);
+  const v = Math.round(amount * factor);
+  return String(v);
 }
 
-export async function executeTrade(tokenAddress: string, action: string, amountInput: number, signalData: any): Promise<void> {
-    try {
-        const { signature, quote } = await handleTradeSignal({
-            token_address: tokenAddress,
-            action: action,
-            amount_input: amountInput, 
-        });
+// -------- core swap --------
+export async function executeSwap(params: {
+  fromMint: string;
+  toMint: string;
+  amount: number; // human units of the FROM mint
+  slippageBps?: number; // default 50 (0.5%)
+}): Promise<{ txSignature: string }> {
+  const { fromMint, toMint, amount } = params;
+  const slippageBps = Number(params.slippageBps ?? 50);
 
-        await logTradeToFirestore({
-            txid: signature, tokenAddress, solAmount: action === 'BUY' ? amountInput : null,
-            action: action.toUpperCase(), date: new Date(), status: 'Success'
-        });
+  // 1) amount in minor units based on FROM mint decimals
+  const decimals = await getMintDecimals(fromMint);
+  const amountMinor = toMinorUnits(amount, decimals);
 
-        if (action.toUpperCase() === 'BUY') {
-            const outputTokenDecimals = await getTokenDecimals(tokenAddress);
-            const tokensReceived = parseInt(quote.outAmount) / Math.pow(10, outputTokenDecimals);
-            
-            await managePosition({
-                txid: signature,
-                tokenAddress: tokenAddress,
-                tokenSymbol: signalData.token_symbol,
-                solAmount: amountInput,
-                tokenAmount: tokensReceived,
-                entryPrice: signalData.price_at_signal,
-                status: 'open',
-                openedAt: new Date(),
-                stopLossPrice: signalData.stop_loss_limit || 0, 
-            });
-        }
-    } catch (error: unknown) {
-        let errorMessage = "An unknown error occurred";
-        if (error instanceof Error) errorMessage = error.message;
-        
-        if (typeof error === 'object' && error !== null && 'response' in error) {
-            const response = (error as any).response;
-            if (response && typeof response.json === 'function') {
-                try {
-                    const errorBody = await response.json();
-                    errorMessage = `Jupiter API Error: ${errorBody.error || JSON.stringify(errorBody)}`;
-                } catch (jsonError) {
-                    errorMessage = `Jupiter API Error: Failed to parse response. Status: ${response.status || 'unknown'}`;
-                }
-            }
-        }
+  L.info("quote", "Requesting quote", { fromMint, toMint, amountMinor, slippageBps });
 
-        console.error(`\n[TRADE FAILED]`, errorMessage);
-        await logTradeToFirestore({
-            tokenAddress, solAmount: action === 'BUY' ? amountInput : null, 
-            action: action.toUpperCase(),
-            date: new Date(), status: 'Failed', error: errorMessage
-        });
-        throw error; 
-    }
+  // 2) QUOTE (Jupiter v6 returns a single best route object)
+  const quoteUrl =
+    `${JUP_BASE}/v6/quote?` +
+    `inputMint=${fromMint}&outputMint=${toMint}&amount=${amountMinor}` +
+    `&slippageBps=${slippageBps}&onlyDirectRoutes=false&fastMode=true`;
+
+  const quoteRes = await fetch(quoteUrl);
+  if (!quoteRes.ok) {
+    const t = await quoteRes.text();
+    throw new Error(`Quote failed: HTTP ${quoteRes.status} ${t}`);
+  }
+  const quote: any = await quoteRes.json(); // <-- explicit any to avoid "unknown" TS error
+
+  if (!quote || typeof quote !== "object" || !("outAmount" in quote)) {
+    throw new Error("No usable quote returned from Jupiter.");
+  }
+
+  L.info("quote", "Got quote", {
+    outAmount: (quote as any).outAmount,
+    inAmount: (quote as any).inAmount,
+    priceImpactPct: (quote as any).priceImpactPct,
+  });
+
+  // 3) SWAP: Jupiter returns a base64 transaction to sign
+  const swapRes = await fetch(`${JUP_BASE}/v6/swap`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      userPublicKey: wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      useSharedAccounts: true,
+      computeUnitPriceMicroLamports: 0,
+      quoteResponse: quote,
+    }),
+  });
+
+  if (!swapRes.ok) {
+    const t = await swapRes.text();
+    throw new Error(`Swap build failed: HTTP ${swapRes.status} ${t}`);
+  }
+  const swapJson: any = await swapRes.json(); // <-- explicit any to avoid "unknown" TS error
+  const b64 = swapJson.swapTransaction as string;
+  if (!b64) throw new Error("No swapTransaction in response");
+
+  const raw = Buffer.from(b64, "base64");
+  const tx = VersionedTransaction.deserialize(raw);
+  tx.sign([wallet]);
+
+  // 4) Send + confirm
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+    maxRetries: 3,
+  });
+
+  L.info("send", "Submitted transaction", { sig });
+  await connection.confirmTransaction(sig, "confirmed");
+  L.info("confirm", "Transaction confirmed", { sig });
+
+  return { txSignature: sig };
+}
+
+// Convenience wrappers (used by webhook adapter)
+export async function buyToken(params: {
+  mint: string; // token to receive
+  amountSol: number; // SOL to spend (human)
+}): Promise<{ txSignature: string }> {
+  return executeSwap({
+    fromMint: SOL_MINT,
+    toMint: params.mint,
+    amount: params.amountSol,
+  });
+}
+
+export async function sellToken(params: {
+  mint: string; // token to sell
+  amountTokens: number; // token amount (human)
+}): Promise<{ txSignature: string }> {
+  return executeSwap({
+    fromMint: params.mint,
+    toMint: SOL_MINT,
+    amount: params.amountTokens,
+  });
 }
