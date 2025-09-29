@@ -1,95 +1,122 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { executeTrade } from './tradeExecutor';
-import {
-  initializeFirebase,
-  getBotSettings,
-  getOpenPositionByToken,
-  closePosition
-} from './firebaseAdmin';
-
-dotenv.config();
+// server/index.ts
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import admin from "firebase-admin";
+import "./firebaseAdmin";
+import nexagentRouter from "./nexagent-signal";
+import { randomUUID } from "crypto";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-initializeFirebase();
+const PORT = Number(process.env.PORT || 3000);
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-app.post('/nexagent-signal', async (req, res) => {
-  console.log('Received signal:', req.body);
+// tiny request log
+app.use((req, _res, next) => {
+  console.log(`➡️  ${req.method} ${req.path}`);
+  next();
+});
 
-  if (!req.body.data || !req.body.data.token_address) {
-    console.error('Invalid signal format. Missing data object or token_address.');
-    return res.status(400).json({ error: 'Invalid signal payload: missing data.token_address' });
-  }
+const L = {
+  info: (scope: string, msg: string, meta?: any) =>
+    console.log(`🟦 [${scope}] ${msg}`, meta ?? ""),
+  warn: (scope: string, msg: string, meta?: any) =>
+    console.warn(`🟨 [${scope}] ${msg}`, meta ?? ""),
+  error: (scope: string, msg: string, meta?: any) =>
+    console.error(`🟥 [${scope}] ${msg}`, meta ?? ""),
+};
 
-  const settings = await getBotSettings();
-  if (!settings || settings.botStatus !== 'RUNNING') {
-    console.log(`Bot status is '${settings?.botStatus || 'OFF'}'. Ignoring signal.`);
-    return res.status(200).json({ message: 'Signal ignored, bot is not running.' });
-  }
+const db = () => admin.firestore();
 
-  const signalData = req.body.data;
-  const { token_address } = signalData;
-
-  // Immediately acknowledge the signal to Nextgent AI
-  res.status(200).json({ message: 'Signal received, processing trade.' });
-
+// Health
+app.get("/healthz", async (_req, res) => {
   try {
-    // Check our database for an existing open position for this token
-    const openPosition = await getOpenPositionByToken(token_address);
-
-    if (signalData.is_active === true) {
-      // --- HANDLE BUY SIGNAL ---
-      console.log(`[BUY SIGNAL] Received for ${token_address}`);
-      
-      // If a position already exists, ignore the signal to prevent double-buying.
-      if (openPosition) {
-        console.log(`[BUY IGNORED] An open position already exists for ${token_address}.`);
-        return;
-      }
-      
-      const amount_sol = settings.maxTradeSizeSol;
-      if (!amount_sol || amount_sol <= 0) {
-        console.log(`[BUY IGNORED] Invalid or zero maxTradeSizeSol configured in settings.`);
-        return;
-      }
-      
-      await executeTrade(token_address, 'BUY', amount_sol, signalData);
-
-    } else if (signalData.is_active === false) {
-      // --- HANDLE SELL SIGNAL ---
-      console.log(`[SELL SIGNAL] Received for ${token_address}`);
-      
-      // If there's no open position to sell, ignore the signal.
-      if (!openPosition) {
-        console.log(`[SELL IGNORED] No open position found for ${token_address}.`);
-        return;
-      }
-
-      if (!openPosition.tokenAmount || openPosition.tokenAmount <= 0) {
-        console.log(`[SELL IGNORED] Position for ${token_address} has an invalid token amount.`);
-        return;
-      }
-      
-      await executeTrade(token_address, 'SELL', openPosition.tokenAmount, signalData);
-      
-      await closePosition(openPosition.id, signalData.price_at_signal, signalData.deactivationReason);
-    }
-
-  } catch (error: unknown) {
-    let errorMessage = "An unknown error occurred in the signal handler.";
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    }
-    console.error(`[FATAL] Error processing signal for ${token_address}:`, errorMessage);
+    await db().collection("settings").doc("bot-settings").get();
+    L.info("healthz", "OK");
+    res.status(200).json({ ok: true });
+  } catch (e: any) {
+    L.error("healthz", "ERROR", e?.message || e);
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
+// ✅ START BOT (server authoritative; creates session + logs)
+app.post("/bot/start", async (req, res) => {
+  const scope = "bot-start";
+  try {
+    // accept either "startingBalance" or "sessionStartingBalance" from client
+    const raw =
+      req.body?.startingBalance ?? req.body?.sessionStartingBalance ?? 0;
+    const starting = Number(raw);
+    if (!Number.isFinite(starting) || starting <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "startingBalance must be > 0" });
+    }
+
+    const sessionId = randomUUID();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    // Match the exact field names your dashboard expects
+    await db().collection("settings").doc("bot-settings").set(
+      {
+        botStatus: "RUNNING",
+        sessionActive: true,
+        currentSessionId: sessionId,
+        sessionStartingBalance: starting,
+        sessionStartTime: now,
+      },
+      { merge: true }
+    );
+
+    L.info(scope, "Bot started", { sessionId, startingBalance: starting });
+    res.status(200).json({ ok: true, sessionId, startingBalance: starting });
+  } catch (e: any) {
+    L.error("bot-start", "Failed", e?.message || e);
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// 🛑 STOP & ARCHIVE (closes opens and turns bot OFF)
+app.post("/bot/stop-and-archive", async (_req, res) => {
+  const scope = "stop-and-archive";
+  try {
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    const openSnap = await db()
+      .collection("positions")
+      .where("status", "==", "open")
+      .get();
+
+    const batch = db().batch();
+    openSnap.forEach((d) =>
+      batch.update(d.ref, {
+        status: "closed",
+        closedAt: now,
+        deactivationReason: "Stopped",
+      })
+    );
+
+    batch.set(
+      db().collection("settings").doc("bot-settings"),
+      { botStatus: "OFF", sessionActive: false, currentSessionId: null },
+      { merge: true }
+    );
+
+    await batch.commit();
+    L.info(scope, "Bot stopped; positions closed", { closed: openSnap.size });
+    res.status(200).json({ ok: true, closed: openSnap.size });
+  } catch (e: any) {
+    L.error(scope, "Failed", e?.message || e);
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Nexgent webhook (POST /nexagent-signal)
+app.use("/", nexagentRouter);
+
 app.listen(PORT, () => {
-  console.log(`Bot server running on http://localhost:${PORT}`);
+  console.log(`🚀 server listening on port ${PORT}`);
 });
