@@ -1,0 +1,11 @@
+# Dependencies
+/node_modules
+
+# Production build
+/dist
+
+# Environment variables
+.env
+
+# Secret Keys
+service-account-key.json
