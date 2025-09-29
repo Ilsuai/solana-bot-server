@@ -9,3 +9,5 @@
 
 # Secret Keys
 service-account-key.json
+# macOS
+.DS_Store
