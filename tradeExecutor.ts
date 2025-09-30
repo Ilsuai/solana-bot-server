@@ -4,7 +4,6 @@ const { getMint } = require('@solana/spl-token');
 const dotenv = require('dotenv');
 const { logTradeToFirestore, managePosition } = require('./firebaseAdmin');
 const bs58 = require('bs58');
-const fetch = require('node-fetch'); // Required for our manual API call
 
 dotenv.config();
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -14,8 +13,6 @@ const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
 const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, 'confirmed');
-
-// We still use the client for the 'swap' part, but not the 'quote'
 const jupiterApi = createJupiterApiClient({ basePath: "https://quote-api.jup.ag/v6" });
 
 async function getPriorityFee(): Promise<number> {
@@ -52,7 +49,6 @@ async function handleTradeSignal(signal: { token_address: string; action: string
   
   console.log(`⚙️  [Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
 
-  // --- MANUAL FETCH FOR QUOTE ---
   console.log('⚙️  [Executor] Manually building and fetching quote from V6 API...');
   const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
   
@@ -63,7 +59,6 @@ async function handleTradeSignal(signal: { token_address: string; action: string
   }
   const quote = await quoteResponse.json();
   if (!quote) throw new Error('Failed to get a valid quote from Jupiter.');
-  // --- END MANUAL FETCH ---
 
   console.log('⚙️  [Executor] Got quote from Jupiter.');
 
