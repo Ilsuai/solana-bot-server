@@ -12,14 +12,16 @@ app.use(express.json());
 
 // The Webhook handler for NextGen AI signals
 app.post('/nexagent-signal', async (req: Request, res: Response) => {
-    console.log('--- SIGNAL RECEIVED ---');
-    console.log('Payload:', JSON.stringify(req.body, null, 2));
+    const signalId = req.body.data?.signal_id || 'Unknown';
+    console.log(`\n================== [SIGNAL ${signalId} RECEIVED] ==================`);
+    console.log(`Full Payload:`, JSON.stringify(req.body, null, 2));
 
     try {
         const payloadData = req.body.data;
         const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
         if (!payloadData || payloadData.transaction_type !== 'swap') {
+            console.log(`❌ Validation Failed: Signal is not a valid swap transaction.`);
             return res.status(400).send('Invalid or unrecognized signal payload.');
         }
 
@@ -32,22 +34,23 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
 
         const tokenAddress = action === 'BUY' ? payloadData.output_mint : payloadData.input_mint;
         const solAmount = action === 'BUY' ? payloadData.input_amount : payloadData.output_amount;
-        const signalId = payloadData.signal_id; // Extract the signal_id
-
+        
         if (!action || !tokenAddress || !solAmount || solAmount <= 0 || !signalId) {
+            console.log(`❌ Validation Failed: Incomplete parameters.`);
             return res.status(400).send('Failed to extract necessary trade parameters from signal.');
         }
 
-        console.log(`✅ Signal Validated: ${action} for token ${tokenAddress} [Signal ID: ${signalId}]`);
+        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
+        console.log(`✅ Signal Validated: ${action} ${solAmount.toFixed(4)} SOL for ${tokenSymbol} (${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)})`);
 
         executeTrade(tokenAddress, action, solAmount, signalId).catch(error => {
-            console.error(`CRITICAL ERROR during async trade execution for ${tokenAddress}:`, error.message);
+            console.error(`CRITICAL ASYNC ERROR for Signal ${signalId}:`, error.message);
         });
 
         res.status(200).send('Webhook received and trade initiated.');
 
     } catch (error) {
-        console.error("A critical error occurred in the webhook handler:", error);
+        console.error(`A critical error occurred in the webhook handler for Signal ${signalId}:`, error);
         res.status(500).send('Internal server error.');
     }
 });

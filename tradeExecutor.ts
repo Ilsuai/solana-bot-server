@@ -39,7 +39,7 @@ async function performSwap(
   amount: number,
   slippageBps: number
 ): Promise<{ txid: string; quote: QuoteResponse }> {
-  console.log(`[Swap] Getting quote from Jupiter with dynamic priority fees...`);
+  console.log(`[Swap] Getting quote from Jupiter...`);
 
   const quote = await jupiterApi.quoteGet({
     inputMint,
@@ -68,8 +68,7 @@ async function performSwap(
   transaction.sign([walletKeypair]);
 
   const rawTransaction = transaction.serialize();
-
-  // CORRECTED LOGIC: Fetch a fresh blockhash right before sending the transaction.
+  
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
   
   const txid = await connection.sendRawTransaction(rawTransaction, {
@@ -77,7 +76,6 @@ async function performSwap(
     maxRetries: 5,
   });
 
-  // Now, confirm using the fresh blockhash we just fetched.
   const confirmation = await connection.confirmTransaction(
     { 
       signature: txid, 
@@ -91,14 +89,14 @@ async function performSwap(
     throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
   }
   
-  console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
+  console.log(`✅ Swap successful! View on Solscan: https://solscan.io/tx/${txid}`);
   return { txid, quote };
 }
 
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
-  solAmount: number, // For BUYs, this is SOL spent. For SELLs, this is SOL received.
+  solAmount: number, // For BUYs, this is SOL spent. For SELLs, this is potential SOL received.
   signalId: number
 ): Promise<void> {
     const slippageSettings = [500, 1500, 2500];
@@ -107,10 +105,12 @@ export async function executeTrade(
         const currentSlippage = slippageSettings[i];
         try {
             console.log(`\n--- [ATTEMPT ${i + 1}/${slippageSettings.length}] ---`);
-            console.log(`Executing ${action} for token ${tokenAddress} with ${currentSlippage / 100}% slippage.`);
 
             if (action === 'BUY') {
+                console.log(`💰 Executing BUY for ${solAmount.toFixed(4)} SOL with ${currentSlippage / 100}% slippage.`);
+                const outputTokenDecimals = await getTokenDecimals(tokenAddress);
                 const amountInLamports = Math.round(solAmount * 10 ** 9);
+                
                 const { txid, quote } = await performSwap(
                     SOL_MINT_ADDRESS,
                     tokenAddress,
@@ -118,9 +118,9 @@ export async function executeTrade(
                     currentSlippage
                 );
                 
-                const outputTokenDecimals = await getTokenDecimals(tokenAddress);
                 const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
                 
+                console.log(`📝 Logging BUY trade to database...`);
                 await logTradeToFirestore({
                     txid, status: 'Success', kind: action, solAmount, tokenAmount: tokenAmountReceived,
                     tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId,
@@ -130,47 +130,54 @@ export async function executeTrade(
                     signal_id: signalId, status: 'open', tokenAddress, solSpent: solAmount,
                     tokenReceived: tokenAmountReceived, openedAt: new Date(),
                 });
-                console.log(`Successfully logged BUY trade and opened position for signal ID: ${signalId}`);
+                console.log(`🎉 Successfully opened position for Signal ID: ${signalId}`);
 
             } else { // Handle SELL action
+                console.log(`🔍 Checking for open position for Signal ID: ${signalId}...`);
                 const position = await getOpenPositionBySignalId(signalId);
                 if (!position) {
-                    console.log(`[Executor] Received SELL signal, but no open position found for signal ID ${signalId}. Ignoring.`);
-                    return; // Exit if we don't own the token for this trade
+                    console.log(`🟡 No open position found for Signal ID ${signalId}. Ignoring SELL signal.`);
+                    console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                    return;
                 }
+                console.log(`✅ Position found. Preparing to sell ${position.tokenReceived.toFixed(2)} tokens.`);
+                console.log(`💰 Executing SELL with ${currentSlippage / 100}% slippage.`);
 
                 const tokenDecimals = await getTokenDecimals(position.tokenAddress);
                 const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
 
                 const { txid, quote } = await performSwap(
-                    position.tokenAddress, // Input is the token we are selling
-                    SOL_MINT_ADDRESS,     // Output is SOL
+                    position.tokenAddress,
+                    SOL_MINT_ADDRESS,
                     amountToSellInSmallestUnit,
                     currentSlippage
                 );
                 
                 const solReceived = Number(quote.outAmount) / 10 ** 9;
 
+                console.log(`📝 Logging SELL trade to database...`);
                 await logTradeToFirestore({
                     txid, status: 'Success', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived,
                     tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId,
                 });
                 
                 await closePosition(String(signalId), txid, solReceived);
-                console.log(`Successfully logged SELL trade and closed position for signal ID: ${signalId}`);
+                console.log(`🎉 Successfully closed position for Signal ID: ${signalId}`);
             }
-
+            
+            console.log(`================== [SIGNAL ${signalId} END] ======================`);
             return; // Exit loop on success
 
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
 
             if (i === slippageSettings.length - 1) {
-                console.error(`🛑 [FATAL] All attempts failed. Aborting trade.`);
+                console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
                 await logTradeToFirestore({
                     txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0,
                     tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId,
                 });
+                console.log(`================== [SIGNAL ${signalId} END] ======================`);
                 throw error;
             }
         }
