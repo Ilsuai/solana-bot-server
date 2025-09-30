@@ -2,11 +2,11 @@ import express, { Request, Response } from 'express';
 import { executeTrade } from './tradeExecutor';
 import { initializeFirebase } from './firebaseAdmin';
 
-// Initialize Firebase Admin SDK
+// Initialize Firebase Admin SDK at the start
 initializeFirebase();
 
 const app = express();
-const port = process.env.PORT || 3001; // Using 3001 to avoid conflicts if run locally
+const port = process.env.PORT || 3001;
 
 app.use(express.json());
 
@@ -45,13 +45,12 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
 
         console.log(`✅ Signal Validated: ${action} ${solAmount} SOL for token ${tokenAddress}`);
 
-        // 5. Execute the trade (asynchronously, don't wait for it to complete)
+        // 5. Execute the trade asynchronously. This sends an immediate "OK" response
+        // to the webhook service and processes the trade in the background.
         executeTrade(tokenAddress, action, solAmount).catch(error => {
-            console.error(`CRITICAL ERROR during async trade execution for ${tokenAddress}:`, error);
-            // Here you might add more robust error logging to a service or Firestore
+            console.error(`CRITICAL ERROR during async trade execution for ${tokenAddress}:`, error.message);
         });
 
-        // Respond immediately to the webhook to prevent timeouts
         res.status(200).send('Webhook received and trade initiated.');
 
     } catch (error) {
