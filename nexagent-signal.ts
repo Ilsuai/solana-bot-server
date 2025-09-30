@@ -87,21 +87,17 @@ function logTrade(doc: Record<string, any>) {
   });
 }
 
-// On-chain decimals lookup (works for SPL Token & Token-2022)
+// On-chain decimals lookup (SPL Token & Token-2022)
 async function getMintDecimals(mint: string): Promise<number> {
   const pk = new PublicKey(mint);
 
-  // Try parsed first (fast & robust)
   const parsed = await connection.getParsedAccountInfo(pk);
   const decParsed =
     (parsed.value?.data as ParsedAccountData | undefined)?.parsed?.info?.decimals;
   if (typeof decParsed === "number") return decParsed;
 
-  // Fallback: raw layout; decimals is a single byte at offset 44
   const acc = await connection.getAccountInfo(pk);
-  if (!acc || acc.data.length < 45) {
-    throw new Error("mint account not found or too small");
-  }
+  if (!acc || acc.data.length < 45) throw new Error("mint account not found or too small");
   return acc.data[44];
 }
 
@@ -134,6 +130,25 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     amountSOL,
     signalId,
   });
+
+  // ---- Min-amount guards (clear errors instead of Jupiter 400) ----
+  if (dir === "BUY" && inputMint === SOL_MINT) {
+    const ui = Number(amountSOL || inputAmount || 0);
+    if (!Number.isFinite(ui) || ui < 0.01) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Amount too small for BUY; use ≥ 0.01 SOL" });
+    }
+  }
+  if (dir === "SELL") {
+    const ui = Number(inputAmount || 0);
+    if (!Number.isFinite(ui) || ui < 0.1) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Amount too small for SELL; use ≥ 0.10" });
+    }
+  }
+  // ----------------------------------------------------------------
 
   // Durable idempotency
   try {
@@ -173,16 +188,18 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   try {
     // Compute input amount in *minor units* for the input mint
     let amountMinor: string;
+    let inUiAmount = 0;
 
     if (inputMint === SOL_MINT) {
       // BUY path (SOL is input)
-      amountMinor = toLamports(amountSOL || inputAmount || 0);
+      inUiAmount = Number(amountSOL || inputAmount || 0);
+      amountMinor = toLamports(inUiAmount);
     } else {
       // SELL path (token is input) – use on-chain decimals
-      const decimals = TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
-      const ui = Number(inputAmount || 0);
-      if (!Number.isFinite(ui) || ui <= 0) throw new Error("invalid inputAmount");
-      amountMinor = BigInt(Math.round(ui * 10 ** decimals)).toString();
+      const decimals =
+        TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
+      inUiAmount = Number(inputAmount || 0);
+      amountMinor = BigInt(Math.round(inUiAmount * 10 ** decimals)).toString();
     }
 
     const exec = await executeSwap({
@@ -197,34 +214,43 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
       cuPriceMicroLamports: CUP,
     });
 
-    // Save trade (no getTransaction fetch needed)
+    // Prepare pretty fields
+    const inSym = TOKENS[inputMint]?.symbol ?? `${inputMint.slice(0, 4)}…`;
+    const outSym = TOKENS[outputMint]?.symbol ?? `${outputMint.slice(0, 4)}…`;
+    const outUi = toUi(exec.outAmount, TOKENS[outputMint]?.decimals);
+    const impactPct = exec.priceImpactPct
+      ? (Number(exec.priceImpactPct) * 100).toFixed(2) + "%"
+      : "n/a";
+
+    // Save trade with rich info (helps dashboard later)
     await logTrade({
       action: dir,
       txid: exec.signature,
       signalId,
       mintIn: inputMint,
       mintOut: outputMint,
+      inSymbol: inSym,
+      outSymbol: outSym,
+      inAmountUi: inUiAmount,
+      outAmountUi: outUi,
       inAmountMinor: amountMinor,
-      outAmount: exec.outAmount,
+      outAmountMinor: exec.outAmount,
       priceImpactPct: exec.priceImpactPct,
+      usedSlippageBps: exec.usedSlippageBps,
+      usedSharedAccounts: exec.usedSharedAccounts,
+      routeDirectOnly: exec.routeDirectOnly,
+      restrictIntermediates: exec.restrictIntermediates,
+      cuPriceMicroLamports: CUP,
     });
 
     await completeSignal(signalKey, "SUCCESS", { signature: exec.signature });
 
-    // Pretty success log
-    const inSym = TOKENS[inputMint]?.symbol ?? `${inputMint.slice(0, 4)}…`;
-    const outSym = TOKENS[outputMint]?.symbol ?? `${outputMint.slice(0, 4)}…`;
-    const outUi = toUi(exec.outAmount, TOKENS[outputMint]?.decimals);
-    const inUi =
-      inputMint === SOL_MINT
-        ? Number(amountSOL || inputAmount || 0)
-        : Number(inputAmount || 0);
-    const impactPct = exec.priceImpactPct
-      ? (Number(exec.priceImpactPct) * 100).toFixed(2) + "%"
-      : "n/a";
-
+    // Pretty success log (now shows the *used* slippage + route)
+    const routeHint = exec.routeDirectOnly
+      ? "route=direct"
+      : "route=aggregated";
     console.log(
-      `🟩 [trade] ${dir} ${fmt(inUi)} ${inSym} → ~${fmt(outUi)} ${outSym} | slip=${slippageBps ?? DEFAULT_SLIPPAGE_BPS}bps cu=${CUP}µ | impact=${impactPct} | sig=${exec.signature}`
+      `🟩 [trade] ${dir} ${fmt(inUiAmount)} ${inSym} → ~${fmt(outUi)} ${outSym} | slipUsed=${exec.usedSlippageBps}bps cu=${CUP}µ ${routeHint} | impact=${impactPct} | sig=${exec.signature}`
     );
 
     return res.json({ ok: true, signature: exec.signature });

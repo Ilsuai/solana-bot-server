@@ -17,7 +17,7 @@ export type ExecArgs = {
   wallet: Keypair;
   fromMint: string;
   toMint: string;
-  amountMinor: string;          // amount for the INPUT mint in smallest units
+  amountMinor: string;          // amount for INPUT mint in smallest units
   slippageBps?: number;
   cuPriceMicroLamports?: number;
   useSharedAccounts?: boolean;  // default true
@@ -28,6 +28,10 @@ export type ExecResult = {
   outAmount?: string;
   inAmount?: string;
   priceImpactPct?: string;
+  usedSlippageBps: number;
+  usedSharedAccounts: boolean;
+  routeDirectOnly: boolean;
+  restrictIntermediates: boolean;
 };
 
 // ---------------- Jupiter helpers ----------------
@@ -51,7 +55,6 @@ async function jupQuote(args: {
   url.searchParams.set("amount", args.amount);
   url.searchParams.set("slippageBps", String(args.slippageBps));
 
-  // Defaults that generally land well
   url.searchParams.set("maxAccounts", String(args.opts?.maxAccounts ?? 64));
   url.searchParams.set(
     "onlyDirectRoutes",
@@ -67,7 +70,6 @@ async function jupQuote(args: {
   const res = await fetch(url.toString());
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    // include body for debugging
     throw new Error(`quote failed ${res.status}: ${text}`);
   }
   const data = await res.json();
@@ -84,7 +86,7 @@ async function jupSwap(args: {
   const body = {
     userPublicKey: args.userPublicKey,
     wrapAndUnwrapSol: true,
-    useSharedAccounts: args.useSharedAccounts ?? true, // may turn off on fallback
+    useSharedAccounts: args.useSharedAccounts ?? true,
     dynamicComputeUnitLimit: true,
     asLegacyTransaction: false, // v0
     computeUnitPriceMicroLamports: args.cuPriceMicroLamports,
@@ -133,8 +135,8 @@ async function buildSignSendConfirm(
   connection: Connection,
   wallet: Keypair,
   quote: any,
-  cuPriceMicroLamports?: number,
-  useSharedAccounts?: boolean
+  cuPriceMicroLamports: number,
+  useSharedAccounts: boolean
 ) {
   const swapResp = await jupSwap({
     userPublicKey: wallet.publicKey.toBase58(),
@@ -156,44 +158,6 @@ async function buildSignSendConfirm(
   return signature;
 }
 
-async function executeOnce({
-  connection,
-  wallet,
-  fromMint,
-  toMint,
-  amountMinor,
-  slippageBps,
-  cuPriceMicroLamports,
-  useSharedAccounts,
-}: ExecArgs): Promise<ExecResult> {
-  const quote = await jupQuote({
-    inputMint: fromMint,
-    outputMint: toMint,
-    amount: amountMinor,
-    slippageBps: slippageBps ?? DEFAULT_SLIPPAGE_BPS,
-    opts: {
-      onlyDirectRoutes: false,
-      restrictIntermediateTokens: false,
-      maxAccounts: 64,
-    },
-  });
-
-  const signature = await buildSignSendConfirm(
-    connection,
-    wallet,
-    quote,
-    cuPriceMicroLamports ?? CUP_DEFAULT,
-    useSharedAccounts
-  );
-
-  return {
-    signature,
-    outAmount: quote.outAmount,
-    inAmount: quote.inAmount,
-    priceImpactPct: quote.priceImpactPct,
-  };
-}
-
 function isStaleOrExpiredError(msg: string) {
   const m = msg.toLowerCase();
   return (
@@ -204,21 +168,82 @@ function isStaleOrExpiredError(msg: string) {
     m.includes("confirmation timeout")
   );
 }
-
 function isJup1771or6001(msg: string) {
   return msg.includes("custom program error: 0x1771") || msg.includes("Custom:6001");
 }
 function isJup1788(msg: string) {
-  return msg.includes("custom program error: 0x1788") || msg.includes("SharedAccountsRoute") || msg.includes("Instruction: Route");
+  return (
+    msg.includes("custom program error: 0x1788") ||
+    msg.includes("SharedAccountsRoute") ||
+    msg.includes("Instruction: Route")
+  );
 }
 function isQuote400(msg: string) {
   return msg.includes("quote failed 400");
 }
 
+async function tryOnce(args: {
+  connection: Connection;
+  wallet: Keypair;
+  fromMint: string;
+  toMint: string;
+  amountMinor: string;
+  slippageBps: number;
+  cuPriceMicroLamports: number;
+  useSharedAccounts: boolean;
+  directOnly: boolean;
+  restrictIntermediates: boolean;
+}): Promise<ExecResult> {
+  const quote = await jupQuote({
+    inputMint: args.fromMint,
+    outputMint: args.toMint,
+    amount: args.amountMinor,
+    slippageBps: args.slippageBps,
+    opts: {
+      onlyDirectRoutes: args.directOnly,
+      restrictIntermediateTokens: args.restrictIntermediates,
+      maxAccounts: 64,
+    },
+  });
+
+  const signature = await buildSignSendConfirm(
+    args.connection,
+    args.wallet,
+    quote,
+    args.cuPriceMicroLamports,
+    args.useSharedAccounts
+  );
+
+  return {
+    signature,
+    outAmount: quote.outAmount,
+    inAmount: quote.inAmount,
+    priceImpactPct: quote.priceImpactPct,
+    usedSlippageBps: args.slippageBps,
+    usedSharedAccounts: args.useSharedAccounts,
+    routeDirectOnly: args.directOnly,
+    restrictIntermediates: args.restrictIntermediates,
+  };
+}
+
 export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
+  const baseSlip = args.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+  const baseCup = args.cuPriceMicroLamports ?? CUP_DEFAULT;
+
   try {
-    // First attempt: shared accounts ON (fast), normal route freedom
-    return await executeOnce({ ...args, useSharedAccounts: args.useSharedAccounts ?? true });
+    // Attempt #1 — shared accounts ON, route freedom
+    return await tryOnce({
+      connection: args.connection,
+      wallet: args.wallet,
+      fromMint: args.fromMint,
+      toMint: args.toMint,
+      amountMinor: args.amountMinor,
+      slippageBps: baseSlip,
+      cuPriceMicroLamports: baseCup,
+      useSharedAccounts: args.useSharedAccounts ?? true,
+      directOnly: false,
+      restrictIntermediates: false,
+    });
   } catch (e: any) {
     const msg = String(e?.message || e);
     const logs = e?.logs || e?.value?.logs;
@@ -229,115 +254,73 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
     const is1788 = isJup1788(msg);
     const isQ400 = isQuote400(msg);
 
-    // -------- Fallback #1: quote 400 → try simpler route (direct-only)
+    // Attempt #2 — handle quote 400 with direct-only
     if (isQ400) {
-      const bumpSlip = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 25;
-      console.warn(`[executor] retry#Q400: direct-only quote, slippageBps=${bumpSlip}`);
-      const quote2 = await jupQuote({
-        inputMint: args.fromMint,
-        outputMint: args.toMint,
-        amount: args.amountMinor,
-        slippageBps: bumpSlip,
-        opts: {
-          onlyDirectRoutes: true,
-          restrictIntermediateTokens: true,
-          maxAccounts: 64,
-        },
+      const slip = baseSlip + 25;
+      console.warn(`[executor] retry#Q400: direct-only quote, slippageBps=${slip}`);
+      return await tryOnce({
+        connection: args.connection,
+        wallet: args.wallet,
+        fromMint: args.fromMint,
+        toMint: args.toMint,
+        amountMinor: args.amountMinor,
+        slippageBps: slip,
+        cuPriceMicroLamports: baseCup,
+        useSharedAccounts: args.useSharedAccounts ?? true,
+        directOnly: true,
+        restrictIntermediates: true,
       });
-      const sig2 = await buildSignSendConfirm(
-        args.connection,
-        args.wallet,
-        quote2,
-        args.cuPriceMicroLamports ?? CUP_DEFAULT,
-        args.useSharedAccounts ?? true
-      );
-      return {
-        signature: sig2,
-        outAmount: quote2.outAmount,
-        inAmount: quote2.inAmount,
-        priceImpactPct: quote2.priceImpactPct,
-      };
     }
 
-    // -------- Fallback #2: Jupiter route/composition fail or expiry/sim → no-shared + bumps
+    // Attempt #2 — 1771/1788/expiry → no shared + bumps
     if (isSimFail || isExpiry || is1788) {
-      const bumpSlippage = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 50;
-      const bumpCup = Math.max(
-        Math.round((args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2),
-        (args.cuPriceMicroLamports ?? CUP_DEFAULT) + 5_000
+      const slip = baseSlip + 50;
+      const cup = Math.max(Math.round(baseCup * 1.2), baseCup + 5_000);
+      console.warn(
+        `[executor] retry#1: reason="${msg}", slippageBps=${slip}, cu=${cup}, useShared=false`
       );
-
-      // Try again with useSharedAccounts = false (different program path)
       try {
-        console.warn(
-          `[executor] retry#1: reason="${msg}", slippageBps=${bumpSlippage}, cu=${bumpCup}, useShared=false`
-        );
-        const quote = await jupQuote({
-          inputMint: args.fromMint,
-          outputMint: args.toMint,
-          amount: args.amountMinor,
-          slippageBps: bumpSlippage,
-          opts: {
-            onlyDirectRoutes: false,
-            restrictIntermediateTokens: false,
-            maxAccounts: 64,
-          },
+        return await tryOnce({
+          connection: args.connection,
+          wallet: args.wallet,
+          fromMint: args.fromMint,
+          toMint: args.toMint,
+          amountMinor: args.amountMinor,
+          slippageBps: slip,
+          cuPriceMicroLamports: cup,
+          useSharedAccounts: false,
+          directOnly: false,
+          restrictIntermediates: false,
         });
-        const sig = await buildSignSendConfirm(
-          args.connection,
-          args.wallet,
-          quote,
-          bumpCup,
-          false
-        );
-        return {
-          signature: sig,
-          outAmount: quote.outAmount,
-          inAmount: quote.inAmount,
-          priceImpactPct: quote.priceImpactPct,
-        };
       } catch (e2: any) {
         const msg2 = String(e2?.message || e2);
         const logs2 = e2?.logs || e2?.value?.logs;
         if (logs2) console.error("[sendTx logs]\n" + logs2.join("\n"));
 
-        // -------- Fallback #3: direct-only + restricted + bumps
+        // Attempt #3 — direct-only + restricted + more bumps
         if (isJup1788(msg2) || isSimFail) {
-          const bumpAgain = bumpSlippage + 25;
-          const cupAgain = bumpCup + 5_000;
+          const slip2 = slip + 25;
+          const cup2 = cup + 5_000;
           console.warn(
-            `[executor] retry#2 (direct+restricted): reason="${msg2}", slippageBps=${bumpAgain}, cu=${cupAgain}, direct=true, restrict=true`
+            `[executor] retry#2 (direct+restricted): reason="${msg2}", slippageBps=${slip2}, cu=${cup2}`
           );
-          const quote2 = await jupQuote({
-            inputMint: args.fromMint,
-            outputMint: args.toMint,
-            amount: args.amountMinor,
-            slippageBps: bumpAgain,
-            opts: {
-              onlyDirectRoutes: true,
-              restrictIntermediateTokens: true,
-              maxAccounts: 64,
-            },
+          return await tryOnce({
+            connection: args.connection,
+            wallet: args.wallet,
+            fromMint: args.fromMint,
+            toMint: args.toMint,
+            amountMinor: args.amountMinor,
+            slippageBps: slip2,
+            cuPriceMicroLamports: cup2,
+            useSharedAccounts: false,
+            directOnly: true,
+            restrictIntermediates: true,
           });
-          const sig2 = await buildSignSendConfirm(
-            args.connection,
-            args.wallet,
-            quote2,
-            cupAgain,
-            false
-          );
-          return {
-            signature: sig2,
-            outAmount: quote2.outAmount,
-            inAmount: quote2.inAmount,
-            priceImpactPct: quote2.priceImpactPct,
-          };
         }
         throw e2;
       }
     }
 
-    // otherwise, bubble up
     throw e;
   }
 }
