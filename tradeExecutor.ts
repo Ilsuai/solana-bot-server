@@ -1,4 +1,4 @@
-import { Connection, Keypair, VersionedTransaction, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, Transaction } from '@solana/web3.js';
 import { getMint } from '@solana/spl-token';
 import dotenv from 'dotenv';
 import { logTradeToFirestore, managePosition } from './firebaseAdmin';
@@ -8,20 +8,16 @@ dotenv.config();
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// --- ROBUST WALLET INITIALIZATION ---
-// This handles both Base58 string and the array format from your brother's code.
 function initializeWallet(): Keypair {
     const privateKey = process.env.PRIVATE_KEY;
     if (!privateKey) throw new Error("PRIVATE_KEY environment variable is not set.");
     try {
-        // Try parsing as a JSON array of numbers first
         return Keypair.fromSecretKey(new Uint8Array(JSON.parse(privateKey)));
-    } catch (e) {
+    } catch {
         try {
-            // Fallback to Base58 string decoding
             return Keypair.fromSecretKey(bs58.decode(privateKey));
         } catch (error) {
-            throw new Error("Failed to initialize wallet. Invalid PRIVATE_KEY format. Must be a Base58 string or a JSON array of numbers.");
+            throw new Error("Failed to initialize wallet from PRIVATE_KEY.");
         }
     }
 }
@@ -31,7 +27,6 @@ const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, "confirmed");
 
-// Helper to get token decimals from the blockchain
 async function getTokenDecimals(mint: string): Promise<number> {
     if (mint === SOL_MINT) return 9;
     const mintPublicKey = new PublicKey(mint);
@@ -39,7 +34,6 @@ async function getTokenDecimals(mint: string): Promise<number> {
     return mintInfo.decimals;
 }
 
-// Main exported function
 module.exports = {
   executeTrade: async function(tokenAddress: string, action: string, amountInput: number, signalData: any): Promise<void> {
     try {
@@ -52,19 +46,17 @@ module.exports = {
       
       console.log(`⚙️ [Executor] Starting ${action} trade for ${amountInput} of ${inputMint}`);
 
-      // 1. Get Quote using direct fetch to Jupiter v6 API
-      const slippageBps = 1500; // Using a high 15% slippage for volatile tokens
-      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}`;
+      // 1. Get Quote
+      const slippageBps = 1500; // 15% slippage for volatile tokens
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}&asLegacyTransaction=true`;
       console.log(`⚙️ [Executor] Fetching quote from URL: ${quoteUrl}`);
       const quoteResponse = await fetch(quoteUrl);
       if (!quoteResponse.ok) {
-        const errorBody = await quoteResponse.text();
-        throw new Error(`Failed to get quote: ${quoteResponse.status} - ${errorBody}`);
+        throw new Error(`Failed to get quote: ${await quoteResponse.text()}`);
       }
       const quote = await quoteResponse.json();
-      console.log('✅ [Executor] Successfully fetched quote.');
 
-      // 2. Get Serialized Transaction using direct fetch
+      // 2. Get Swap Transaction
       console.log('⚙️ [Executor] Fetching swap transaction...');
       const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
         method: 'POST',
@@ -73,25 +65,28 @@ module.exports = {
           quoteResponse: quote,
           userPublicKey: walletKeypair.publicKey.toBase58(),
           wrapAndUnwrapSol: true,
+          asLegacyTransaction: true,
         })
       });
       if (!swapResponse.ok) {
         throw new Error(`Failed to get swap transaction: ${await swapResponse.text()}`);
       }
       const { swapTransaction, lastValidBlockHeight } = await swapResponse.json();
-      console.log('✅ [Executor] Successfully fetched swap transaction.');
 
-      // 3. Sign and Send Transaction
+      // 3. Deserialize and Sign
       const txBuffer = Buffer.from(swapTransaction, 'base64');
-      let tx = VersionedTransaction.deserialize(txBuffer);
-      tx.sign([walletKeypair]);
+      const transaction = Transaction.from(txBuffer);
+
+      // --- THIS IS THE FIX ---
+      // Legacy transactions are signed directly, not with an array
+      transaction.sign(walletKeypair);
+
       console.log('⚙️ [Executor] Transaction signed. Sending...');
 
-      const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-
-      // 4. Confirm Transaction
+      // 4. Send and Confirm
+      const signature = await connection.sendRawTransaction(transaction.serialize());
       await connection.confirmTransaction({
-        blockhash: tx.message.recentBlockhash,
+        blockhash: (await connection.getLatestBlockhash()).blockhash,
         lastValidBlockHeight: lastValidBlockHeight,
         signature: signature,
       }, 'confirmed');
