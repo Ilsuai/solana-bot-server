@@ -9,7 +9,7 @@ import {
   QuoteResponse,
 } from '@jup-ag/api';
 import { getMint } from '@solana/spl-token';
-import { logTradeToFirestore, managePosition } from './firebaseAdmin';
+import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
@@ -46,7 +46,7 @@ async function performSwap(
     outputMint,
     amount,
     slippageBps,
-    // @ts-ignore - Bypasses a known local editor issue. This works on the server.
+    // @ts-ignore - This bypasses a known local editor issue. This works on the server.
     priorityFeeLevel: 'VERY_HIGH',
     asLegacyTransaction: false,
   });
@@ -71,7 +71,7 @@ async function performSwap(
 
   // CORRECTED LOGIC: Fetch a fresh blockhash right before sending the transaction.
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-
+  
   const txid = await connection.sendRawTransaction(rawTransaction, {
     skipPreflight: true,
     maxRetries: 5,
@@ -95,49 +95,72 @@ async function performSwap(
   return { txid, quote };
 }
 
-// The 'executeTrade' function remains the same.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
-  solAmount: number
+  solAmount: number, // For BUYs, this is SOL spent. For SELLs, this is SOL received.
+  signalId: number
 ): Promise<void> {
-    if (action !== 'BUY') {
-        console.log(`[Executor] SELL logic not implemented. Ignoring signal.`);
-        return;
-    }
-    
-    const amountInLamports = Math.round(solAmount * 10 ** 9);
     const slippageSettings = [500, 1500, 2500];
 
     for (let i = 0; i < slippageSettings.length; i++) {
         const currentSlippage = slippageSettings[i];
         try {
             console.log(`\n--- [ATTEMPT ${i + 1}/${slippageSettings.length}] ---`);
-            console.log(`Executing ${action} for ${solAmount} SOL on token ${tokenAddress} with ${currentSlippage / 100}% slippage.`);
+            console.log(`Executing ${action} for token ${tokenAddress} with ${currentSlippage / 100}% slippage.`);
 
-            const { txid, quote } = await performSwap(
-                SOL_MINT_ADDRESS,
-                tokenAddress,
-                amountInLamports,
-                currentSlippage
-            );
-            
-            const outputTokenDecimals = await getTokenDecimals(tokenAddress);
-            const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
-            
-            await logTradeToFirestore({
-                txid, status: 'Success', kind: action, solAmount,
-                tokenAmount: tokenAmountReceived, tokenAddress,
-                slippageBps: currentSlippage, date: new Date(),
-            });
-            
-            await managePosition({
-                txid, status: 'open', tokenAddress, solSpent: solAmount, 
-                tokenReceived: tokenAmountReceived, openedAt: new Date(),
-            });
+            if (action === 'BUY') {
+                const amountInLamports = Math.round(solAmount * 10 ** 9);
+                const { txid, quote } = await performSwap(
+                    SOL_MINT_ADDRESS,
+                    tokenAddress,
+                    amountInLamports,
+                    currentSlippage
+                );
+                
+                const outputTokenDecimals = await getTokenDecimals(tokenAddress);
+                const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
+                
+                await logTradeToFirestore({
+                    txid, status: 'Success', kind: action, solAmount, tokenAmount: tokenAmountReceived,
+                    tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId,
+                });
+                
+                await managePosition({
+                    signal_id: signalId, status: 'open', tokenAddress, solSpent: solAmount,
+                    tokenReceived: tokenAmountReceived, openedAt: new Date(),
+                });
+                console.log(`Successfully logged BUY trade and opened position for signal ID: ${signalId}`);
 
-            console.log(`Successfully logged trade and position for tx: ${txid}`);
-            return;
+            } else { // Handle SELL action
+                const position = await getOpenPositionBySignalId(signalId);
+                if (!position) {
+                    console.log(`[Executor] Received SELL signal, but no open position found for signal ID ${signalId}. Ignoring.`);
+                    return; // Exit if we don't own the token for this trade
+                }
+
+                const tokenDecimals = await getTokenDecimals(position.tokenAddress);
+                const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
+
+                const { txid, quote } = await performSwap(
+                    position.tokenAddress, // Input is the token we are selling
+                    SOL_MINT_ADDRESS,     // Output is SOL
+                    amountToSellInSmallestUnit,
+                    currentSlippage
+                );
+                
+                const solReceived = Number(quote.outAmount) / 10 ** 9;
+
+                await logTradeToFirestore({
+                    txid, status: 'Success', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived,
+                    tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId,
+                });
+                
+                await closePosition(String(signalId), txid, solReceived);
+                console.log(`Successfully logged SELL trade and closed position for signal ID: ${signalId}`);
+            }
+
+            return; // Exit loop on success
 
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
@@ -145,8 +168,8 @@ export async function executeTrade(
             if (i === slippageSettings.length - 1) {
                 console.error(`🛑 [FATAL] All attempts failed. Aborting trade.`);
                 await logTradeToFirestore({
-                    txid: null, status: 'Failed', kind: action, solAmount, tokenAddress,
-                    reason: error.message || 'Unknown error', date: new Date(),
+                    txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0,
+                    tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId,
                 });
                 throw error;
             }

@@ -3,6 +3,10 @@ import admin from 'firebase-admin';
 let db: admin.firestore.Firestore;
 
 export function initializeFirebase() {
+  if (admin.apps.length) {
+    db = admin.firestore();
+    return;
+  }
   try {
     const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
@@ -28,49 +32,49 @@ export async function logTradeToFirestore(tradeData: any) {
   }
 }
 
-export async function getBotSettings() {
-  if (!db) return null;
-  try {
-    const doc = await db.collection('settings').doc('bot-settings').get();
-    return doc.exists ? doc.data() : null;
-  } catch (error) {
-    console.error('Failed to fetch bot settings:', error);
-    return null;
-  }
-}
-
 export async function managePosition(positionData: any) {
   if (!db) return;
   try {
-    await db.collection('positions').doc(positionData.txid).set(positionData, { merge: true });
+    // Use signal_id as the document ID for easy lookup
+    await db.collection('positions').doc(String(positionData.signal_id)).set(positionData, { merge: true });
   } catch (error) {
     console.error('Failed to manage position:', error);
   }
 }
 
-export async function getOpenPositionByToken(tokenAddress: string): Promise<any | null> {
+export async function getOpenPositionBySignalId(signalId: number): Promise<any | null> {
   if (!db) return null;
   try {
-    const snapshot = await db.collection('positions').where('tokenAddress', '==', tokenAddress).where('status', '==', 'open').limit(1).get();
-    if (snapshot.empty) return null;
-    const doc = snapshot.docs[0];
-    return { id: doc.id, ...doc.data() };
+    const docRef = db.collection('positions').doc(String(signalId));
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return null;
+    }
+    
+    const position = doc.data();
+    if (position && position.status === 'open') {
+        return { id: doc.id, ...position };
+    }
+    
+    return null;
   } catch (error) {
-    console.error(`Failed to fetch open position for ${tokenAddress}:`, error);
+    console.error(`Failed to fetch open position for signal ID ${signalId}:`, error);
     return null;
   }
 }
 
-export async function closePosition(docId: string, sellPrice: number, reason: string | null): Promise<void> {
+export async function closePosition(signalId: string, sellTxid: string, solReceived: number) {
   if (!db) return;
   try {
-    await db.collection('positions').doc(docId).update({
+    const docRef = db.collection('positions').doc(signalId);
+    await docRef.update({
       status: 'closed',
-      sellPrice,
+      exitTx: sellTxid,
+      solReceived: solReceived,
       closedAt: new Date(),
-      deactivationReason: reason || 'Unknown'
     });
   } catch (error) {
-    console.error(`Failed to close position ${docId}:`, error);
+    console.error(`Failed to close position ${signalId}:`, error);
   }
 }

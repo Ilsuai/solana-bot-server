@@ -32,14 +32,15 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
 
         const tokenAddress = action === 'BUY' ? payloadData.output_mint : payloadData.input_mint;
         const solAmount = action === 'BUY' ? payloadData.input_amount : payloadData.output_amount;
+        const signalId = payloadData.signal_id; // Extract the signal_id
 
-        if (!action || !tokenAddress || !solAmount || solAmount <= 0) {
-            return res.status(400).send('Failed to extract necessary trade parameters.');
+        if (!action || !tokenAddress || !solAmount || solAmount <= 0 || !signalId) {
+            return res.status(400).send('Failed to extract necessary trade parameters from signal.');
         }
 
-        console.log(`✅ Signal Validated: ${action} ${solAmount} SOL for token ${tokenAddress}`);
+        console.log(`✅ Signal Validated: ${action} for token ${tokenAddress} [Signal ID: ${signalId}]`);
 
-        executeTrade(tokenAddress, action, solAmount).catch(error => {
+        executeTrade(tokenAddress, action, solAmount, signalId).catch(error => {
             console.error(`CRITICAL ERROR during async trade execution for ${tokenAddress}:`, error.message);
         });
 
