@@ -132,8 +132,9 @@ async function handleTradeSignal(signal: { token_address: string, action: string
         maxRetries: 2,
     });
 
+    // --- THIS IS THE FIX ---
     await connection.confirmTransaction({
-        blockhash: transaction.message.recentBlackhash,
+        blockhash: transaction.message.recentBlockhash, // Corrected 'recentBlockhash'
         lastValidBlockHeight: lastValidBlockHeight,
         signature: txSignature
     }, 'confirmed');
