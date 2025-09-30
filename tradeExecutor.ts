@@ -5,12 +5,9 @@ import bs58 from 'bs58';
 import dotenv from 'dotenv';
 import { logTradeToFirestore, managePosition } from './firebaseAdmin';
 
-// NOTE: This version does not require 'node-fetch' or '@solana/spl-token' imports here.
-
 dotenv.config();
 
 const SOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112";
-
 const WALLET_PRIVATE_KEY = process.env.PRIVATE_KEY;
 if (!WALLET_PRIVATE_KEY) throw new Error("PRIVATE_KEY is missing from the .env file.");
 const wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
@@ -19,8 +16,7 @@ const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, "confirmed");
 
-// --- FIX #1: MORE ROBUST 'getTokenDecimals' FUNCTION ---
-// This new version doesn't rely on 'getMint' and instead parses account data directly.
+// This function correctly gets a token's decimals from the blockchain.
 async function getTokenDecimals(mintAddress: string): Promise<number> {
     if (mintAddress === SOL_MINT_ADDRESS) return 9;
     const mintPublicKey = new PublicKey(mintAddress);
@@ -28,12 +24,12 @@ async function getTokenDecimals(mintAddress: string): Promise<number> {
     if (!accountInfo) {
         throw new Error(`Could not find mint account for ${mintAddress}`);
     }
-    // The decimals value is the first byte of the mint account data
+    // The decimals value is the first byte of the mint account data buffer
     const decimals = accountInfo.data.readUInt8(0);
     return decimals;
 }
 
-
+// This is our memory-efficient Jupiter instance initializer.
 async function getJupiterInstance(): Promise<Jupiter> {
   return Jupiter.load({
     connection,
@@ -43,33 +39,25 @@ async function getJupiterInstance(): Promise<Jupiter> {
   });
 }
 
-// --- FIX #2: CORRECTLY HANDLE THE 'exchange' RESPONSE ---
-// This function now correctly destructures the response from Jupiter.
 async function executeSwap(jupiter: Jupiter, route: RouteInfo): Promise<string | null> {
-    // The 'exchange' method returns 'swapTransaction', not a nested 'transactions' object.
     const { swapTransaction } = await jupiter.exchange({ routeInfo: route });
 
     if (swapTransaction) {
         const rawTx = swapTransaction.serialize();
-        const txid = await connection.sendRawTransaction(rawTx, {
-            skipPreflight: true,
-            maxRetries: 5,
-        });
-
+        const txid = await connection.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 5 });
         const latestBlockHash = await connection.getLatestBlockhash();
         await connection.confirmTransaction({
             blockhash: latestBlockHash.blockhash,
             lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
             signature: txid,
         });
-        
         console.log(`✅ [Executor] Transaction Confirmed! Signature: ${txid}`);
         return txid;
     }
     return null;
 }
 
-// Main exported function
+// Main exported function with the fixes applied.
 module.exports = {
   executeTrade: async function(tokenAddress: string, action: string, amountInput: number, signalData: any): Promise<void> {
     try {
@@ -79,9 +67,8 @@ module.exports = {
       const inputMint = new PublicKey(isBuy ? SOL_MINT_ADDRESS : tokenAddress);
       const outputMint = new PublicKey(isBuy ? tokenAddress : SOL_MINT_ADDRESS);
       
-      const inputMintInfoDecimals = await getTokenDecimals(inputMint.toBase58());
-      
-      const amountInSmallestUnits = JSBI.BigInt(Math.round(amountInput * (10 ** inputMintInfoDecimals)));
+      const inputMintDecimals = await getTokenDecimals(inputMint.toBase58());
+      const amountInSmallestUnits = JSBI.BigInt(Math.round(amountInput * (10 ** inputMintDecimals)));
 
       console.log(`⚙️  [Executor] Finding routes for ${action} ${amountInput}...`);
       
@@ -89,7 +76,7 @@ module.exports = {
           inputMint,
           outputMint,
           amount: amountInSmallestUnits,
-          slippageBps: 1500, // 15% slippage, suitable for volatile tokens
+          slippageBps: 1500, // 15%
           forceFetch: true,
       });
 
@@ -107,9 +94,10 @@ module.exports = {
         txid: signature, tokenAddress, solAmount: isBuy ? amountInput : null,
         action: action.toUpperCase(), date: new Date(), status: 'Success',
       });
+
       if (isBuy) {
-        const outputMintInfoDecimals = await getTokenDecimals(outputMint.toBase58());
-        const tokensReceived = Number(bestRoute.outAmount.toString()) / (10 ** outputMintInfoDecimals);
+        const outputMintDecimals = await getTokenDecimals(outputMint.toBase58());
+        const tokensReceived = Number(bestRoute.outAmount.toString()) / (10 ** outputMintDecimals);
         await managePosition({
           txid: signature, tokenAddress, tokenSymbol: signalData.token_symbol || 'Unknown',
           solAmount: amountInput, tokenAmount: tokensReceived, entryPrice: signalData.price_at_signal || 0,
