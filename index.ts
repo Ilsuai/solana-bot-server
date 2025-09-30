@@ -43,10 +43,16 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
 
   try {
     const settings = await getBotSettings();
-    if (!settings || settings.botStatus !== 'RUNNING') {
-      console.log(`⏸️ [Bot Not Running] Status is '${settings?.botStatus || 'OFF'}'. Ignoring signal.`);
+
+    // --- THIS IS THE FIX ---
+    // We explicitly check that botStatus is a string before comparing it.
+    const status = settings?.botStatus;
+    if (!settings || typeof status !== 'string' || status !== 'RUNNING') {
+      console.log(`⏸️ [Bot Not Running] Status is '${status || 'OFF'}'. Ignoring signal.`);
       return;
     }
+    // --- END OF FIX ---
+
     const tokenAddress = dir.toUpperCase() === 'BUY' ? outputMint : inputMint;
     const openPosition = await getOpenPositionByToken(tokenAddress);
     if (dir.toUpperCase() === 'BUY') {
