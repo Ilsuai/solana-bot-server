@@ -43,7 +43,7 @@ async function getPriorityFee(): Promise<number> {
     try {
         const prioritizationFees = await connection.getRecentPrioritizationFees();
         if (prioritizationFees.length === 0) {
-            console.log("[Fee] No recent priority fees found, using minimum.");
+            console.log("💸 [Fee] No recent priority fees found, using minimum.");
             return minFee;
         }
 
@@ -52,7 +52,7 @@ async function getPriorityFee(): Promise<number> {
             .filter(fee => fee <= maxFee);
 
         if (recentFees.length === 0) {
-            console.log("[Fee] No recent fees within a reasonable range, using minimum.");
+            console.log("💸 [Fee] No recent fees within a reasonable range, using minimum.");
             return minFee;
         }
 
@@ -64,11 +64,11 @@ async function getPriorityFee(): Promise<number> {
         const boostedFee = aggressiveFee + 1;
         const finalFee = Math.max(boostedFee, minFee);
 
-        console.log(`[Fee] Aggressive fee (95th percentile + 1): ${finalFee} microLamports`);
+        console.log(`💸 [Fee] Aggressive fee (95th percentile + 1): ${finalFee} microLamports`);
         return finalFee;
 
     } catch (error) {
-        console.error("[Fee] Failed to get dynamic priority fee, using minimum.", error);
+        console.error("🛑 [Fee] Failed to get dynamic priority fee, using minimum.", error);
         return minFee;
     }
 }
@@ -97,7 +97,7 @@ async function handleTradeSignal(signal: { token_address: string, action: string
     
     if (amountInSmallestUnits <= 0) throw new Error(`Invalid amount: ${amount_input}`);
 
-    console.log(`[Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
+    console.log(`⚙️  [Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
 
     const quote: QuoteResponse = await jupiterApi.quoteGet({
         inputMint,
@@ -108,6 +108,7 @@ async function handleTradeSignal(signal: { token_address: string, action: string
     });
 
     if (!quote) throw new Error('Failed to get a valid quote from Jupiter.');
+    console.log('⚙️  [Executor] Got quote from Jupiter.');
 
     const { swapTransaction, lastValidBlockHeight } = await jupiterApi.swapPost({
         swapRequest: {
@@ -117,12 +118,13 @@ async function handleTradeSignal(signal: { token_address: string, action: string
             computeUnitPriceMicroLamports: await getPriorityFee(),
         } as SwapRequest
     });
+    console.log('⚙️  [Executor] Received transaction from Jupiter.');
 
     const transactionBuffer = Buffer.from(swapTransaction, 'base64');
     let transaction = VersionedTransaction.deserialize(transactionBuffer);
     
     transaction.sign([walletKeypair]);
-    console.log('[Executor] Transaction signed. Sending...');
+    console.log('⚙️  [Executor] Transaction signed. Sending...');
 
     const rawTransaction = transaction.serialize();
     const txSignature = await connection.sendRawTransaction(rawTransaction, {
@@ -131,12 +133,12 @@ async function handleTradeSignal(signal: { token_address: string, action: string
     });
 
     await connection.confirmTransaction({
-        blockhash: transaction.message.recentBlockhash,
+        blockhash: transaction.message.recentBlackhash,
         lastValidBlockHeight: lastValidBlockHeight,
         signature: txSignature
     }, 'confirmed');
 
-    console.log(`[Executor] ✅ Trade Confirmed! Signature: ${txSignature}`);
+    console.log(`✅ [Executor] Trade Confirmed! Signature: ${txSignature}`);
     
     return { signature: txSignature, quote };
 }
@@ -161,10 +163,10 @@ export async function executeTrade(tokenAddress: string, action: string, amountI
             await managePosition({
                 txid: signature,
                 tokenAddress: tokenAddress,
-                tokenSymbol: signalData.token_symbol,
+                tokenSymbol: signalData.token_symbol || 'Unknown',
                 solAmount: amountInput,
                 tokenAmount: tokensReceived,
-                entryPrice: signalData.price_at_signal,
+                entryPrice: signalData.price_at_signal || 0,
                 status: 'open',
                 openedAt: new Date(),
                 stopLossPrice: signalData.stop_loss_limit || 0, 
@@ -174,7 +176,7 @@ export async function executeTrade(tokenAddress: string, action: string, amountI
         let errorMessage = "An unknown error occurred";
         if (error instanceof Error) errorMessage = error.message;
         
-        console.error(`\n[TRADE FAILED]`, errorMessage);
+        console.error(`\n❌ [TRADE FAILED]`, errorMessage);
         await logTradeToFirestore({
             tokenAddress, solAmount: action === 'BUY' ? amountInput : null, 
             action: action.toUpperCase(),
