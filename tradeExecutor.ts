@@ -41,16 +41,11 @@ async function performSwap(
 ): Promise<{ txid: string; quote: QuoteResponse }> {
   console.log(`[Swap] Getting quote from Jupiter...`);
 
-  const priorityFee = process.env.PRIORITY_FEE_MICRO_LAMPORTS
-    ? parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS, 10)
-    : 50000;
-
   const quote = await jupiterApi.quoteGet({
     inputMint,
     outputMint,
     amount,
     slippageBps,
-    computeUnitPriceMicroLamports: priorityFee,
     asLegacyTransaction: false,
   });
 
@@ -101,7 +96,7 @@ export async function executeTrade(
     }
     
     const amountInLamports = Math.round(solAmount * 10 ** 9);
-    const slippageSettings = [500, 1500, 2500]; // 5%, 15%, 25%
+    const slippageSettings = [500, 1500, 2500];
 
     for (let i = 0; i < slippageSettings.length; i++) {
         const currentSlippage = slippageSettings[i];
