@@ -18,6 +18,10 @@ const DEFAULT_SLIPPAGE_BPS = Number(process.env.DEFAULT_SLIPPAGE_BPS || 50);
 const CUP = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS || 0);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
+// Strategy toggle (optional)
+const MIRROR_ONLY = String(process.env.MIRROR_ONLY || "true") === "true";
+const DEFAULT_BUY_SOL = Number(process.env.DEFAULT_BUY_SOL || 0.1);
+
 // Mints
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -145,7 +149,7 @@ function normalize(raw: any): AgentTx {
     toSide(d.transaction_side) ||
     toSide(d.transaction_direction);
 
-  // 3) mints (look in several shapes; Nexgent often nests under swap/swap_data/transaction)
+  // 3) mints (Nexgent often nests under swap/swap_data/transaction)
   const s = d.swap || d.swap_data || d.transaction || d.txn || d.trade || d.details || {};
 
   const inputMint =
@@ -183,7 +187,7 @@ function normalize(raw: any): AgentTx {
     s.ui_amount_in ??
     d.uiAmount ??
     d.amount ??
-    d.transaction_amount ?? // <— common in Nexgent payloads
+    d.transaction_amount ??
     s.transaction_amount;
 
   const outputAmount =
@@ -301,6 +305,43 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     finalBody.amountSOL = Number(finalBody.inputAmount);
   }
 
+  // --- Optional strategy mode: convert "tradeSignals" into a BUY of DEFAULT_BUY_SOL ---
+  if (!MIRROR_ONLY && (finalBody.event === "tradeSignals" || raw?.event === "tradeSignals")) {
+    const tokenAddr =
+      raw?.data?.token_address ||
+      raw?.data?.tokenAddress ||
+      body?.raw?.data?.token_address ||
+      body?.raw?.data?.tokenAddress;
+
+    if (typeof tokenAddr === "string" && tokenAddr.length >= 32) {
+      finalBody.dir = "BUY";
+      finalBody.inputMint = SOL_MINT;
+      finalBody.outputMint = tokenAddr;
+      finalBody.amountSOL = DEFAULT_BUY_SOL;
+      finalBody.inputAmount = DEFAULT_BUY_SOL;
+      finalBody.signalId = String(
+        finalBody.signalId ??
+          raw?.data?.id ??
+          raw?.data?.signal_id ??
+          raw?.data?.tradeId ??
+          raw?.data?.created_at ??
+          Date.now()
+      );
+      console.warn("[nexagent-signal] tradeSignals -> SYNTH BUY", {
+        token: tokenAddr,
+        amountSOL: DEFAULT_BUY_SOL,
+        signalId: finalBody.signalId,
+      });
+    } else {
+      console.warn("[nexagent-signal] tradeSignals ignored (no token_address)");
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "tradeSignals without token_address",
+      });
+    }
+  }
+
   console.log("[nexagent-signal] RX", {
     dir: finalBody.dir,
     inputMint: finalBody.inputMint,
@@ -320,7 +361,6 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     const preview =
       typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
     console.warn("[nexagent-signal] Ignored (no actionable swap fields)", { preview });
-    // Return 200 so we don't keep erroring for non-executable signals
     return res.status(200).json({
       ok: true,
       ignored: true,
