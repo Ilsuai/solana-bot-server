@@ -1,116 +1,112 @@
-import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import { Jupiter, RouteInfo } from '@jup-ag/core';
-import JSBI from 'jsbi';
-import bs58 from 'bs58';
+import { Connection, Keypair, VersionedTransaction, PublicKey } from '@solana/web3.js';
+import { getMint } from '@solana/spl-token';
 import dotenv from 'dotenv';
 import { logTradeToFirestore, managePosition } from './firebaseAdmin';
+import bs58 from 'bs58';
 
 dotenv.config();
 
-const SOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112";
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
 const WALLET_PRIVATE_KEY = process.env.PRIVATE_KEY;
 if (!WALLET_PRIVATE_KEY) throw new Error("PRIVATE_KEY is missing from the .env file.");
-const wallet = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
 
 const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, "confirmed");
 
-// FIX: This robust function gets token decimals without the 'getMint' import error.
-async function getTokenDecimals(mintAddress: string): Promise<number> {
-    if (mintAddress === SOL_MINT_ADDRESS) return 9;
-    const mintPublicKey = new PublicKey(mintAddress);
-    const accountInfo = await connection.getAccountInfo(mintPublicKey);
-    if (!accountInfo) {
-        throw new Error(`Could not find mint account for ${mintAddress}`);
-    }
-    const decimals = accountInfo.data.readUInt8(0);
-    return decimals;
+// Helper function to get token decimals
+async function getTokenDecimals(mint: string): Promise<number> {
+  if (mint === SOL_MINT) return 9;
+  const mintPublicKey = new PublicKey(mint);
+  const mintInfo = await getMint(connection, mintPublicKey);
+  return mintInfo.decimals;
 }
 
-// This is the memory-efficient way to load Jupiter
-async function getJupiterInstance(): Promise<Jupiter> {
-  return Jupiter.load({
-    connection,
-    cluster: "mainnet-beta",
-    user: wallet,
-    wrapUnwrapSOL: true,
-  });
-}
-
-async function executeSwap(jupiter: Jupiter, route: RouteInfo): Promise<string | null> {
-    // FIX: The 'exchange' method returns 'swapTransaction' directly, not a nested 'transactions' object.
-    const { swapTransaction } = await jupiter.exchange({ 
-        // FIX: The parameter name is 'routeInfo', not 'route'.
-        routeInfo: route 
-    });
-
-    if (swapTransaction) {
-        const rawTx = swapTransaction.serialize();
-        const txid = await connection.sendRawTransaction(rawTx, {
-            skipPreflight: true,
-            maxRetries: 5,
-        });
-
-        const latestBlockHash = await connection.getLatestBlockhash();
-        await connection.confirmTransaction({
-            blockhash: latestBlockHash.blockhash,
-            lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-            signature: txid,
-        });
-        
-        console.log(`✅ [Executor] Transaction Confirmed! Signature: ${txid}`);
-        return txid;
-    }
-    return null;
-}
-
+// Main exported function
 module.exports = {
   executeTrade: async function(tokenAddress: string, action: string, amountInput: number, signalData: any): Promise<void> {
     try {
-      const jupiter = await getJupiterInstance();
-      
       const isBuy = action.toUpperCase() === 'BUY';
-      const inputMint = new PublicKey(isBuy ? SOL_MINT_ADDRESS : tokenAddress);
-      const outputMint = new PublicKey(isBuy ? tokenAddress : SOL_MINT_ADDRESS);
-      
-      const inputMintDecimals = await getTokenDecimals(inputMint.toBase58());
-      
-      // FIX: The amount must be passed as a JSBI object.
-      const amountInSmallestUnits = JSBI.BigInt(Math.round(amountInput * (10 ** inputMintDecimals)));
+      const inputMint = isBuy ? SOL_MINT : tokenAddress;
+      const outputMint = isBuy ? tokenAddress : SOL_MINT;
 
-      console.log(`⚙️  [Executor] Finding routes for ${action} ${amountInput}...`);
+      const inputDecimals = await getTokenDecimals(inputMint);
+      const amountInSmallestUnits = Math.round(amountInput * (10 ** inputDecimals));
       
-      const routes = await jupiter.computeRoutes({
-          inputMint,
-          outputMint,
-          amount: amountInSmallestUnits,
-          slippageBps: 1500, // 15%
-          forceFetch: true,
+      console.log(`⚙️ [Executor] Starting ${action} trade for ${amountInput} of ${inputMint}`);
+
+      // 1. Get Quote using direct fetch
+      console.log('⚙️ [Executor] Fetching quote from Jupiter API...');
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=1500`; // 15% slippage
+      const quoteResponse = await fetch(quoteUrl);
+      if (!quoteResponse.ok) {
+        throw new Error(`Failed to get quote: ${await quoteResponse.text()}`);
+      }
+      const quote = await quoteResponse.json();
+
+      // 2. Get Serialized Transaction using direct fetch
+      console.log('⚙️ [Executor] Fetching swap transaction...');
+      const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          quoteResponse: quote,
+          userPublicKey: walletKeypair.publicKey.toBase58(),
+          wrapAndUnwrapSol: true,
+        })
       });
 
-      if (!routes.routesInfos || routes.routesInfos.length === 0) {
-        throw new Error("Could not find any routes for this trade.");
+      if (!swapResponse.ok) {
+        throw new Error(`Failed to get swap transaction: ${await swapResponse.text()}`);
       }
-      
-      const bestRoute = routes.routesInfos[0];
-      console.log(`⚙️  [Executor] Best route found. Executing swap...`);
-      
-      const signature = await executeSwap(jupiter, bestRoute);
-      if (!signature) throw new Error("Swap transaction did not return a signature.");
+      const { swapTransaction, lastValidBlockHeight } = await swapResponse.json();
 
-      await logTradeToFirestore({ /* log data */ });
+      // 3. Sign and Send Transaction
+      const txBuffer = Buffer.from(swapTransaction, 'base64');
+      let tx = VersionedTransaction.deserialize(txBuffer);
+      tx.sign([walletKeypair]);
+      console.log('⚙️ [Executor] Transaction signed. Sending...');
+
+      const signature = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: true,
+        maxRetries: 5,
+      });
+
+      // 4. Confirm Transaction
+      await connection.confirmTransaction({
+        blockhash: tx.message.recentBlockhash,
+        lastValidBlockHeight: lastValidBlockHeight,
+        signature: signature,
+      }, 'confirmed');
+      console.log(`✅ [Executor] Trade Confirmed! Signature: ${signature}`);
+
+      // 5. Log to Firestore
+      await logTradeToFirestore({
+        txid: signature, tokenAddress, solAmount: isBuy ? amountInput : null,
+        action: action.toUpperCase(), date: new Date(), status: 'Success',
+      });
       if (isBuy) {
-        const outputMintDecimals = await getTokenDecimals(outputMint.toBase58());
-        const tokensReceived = Number(bestRoute.outAmount.toString()) / (10 ** outputMintDecimals);
-        await managePosition({ /* position data */ });
+        const outDecimals = await getTokenDecimals(outputMint);
+        const tokensReceived = parseInt(quote.outAmount) / (10 ** outDecimals);
+        await managePosition({
+          txid: signature, tokenAddress, tokenSymbol: signalData.token_symbol || 'Unknown',
+          solAmount: amountInput, tokenAmount: tokensReceived, entryPrice: signalData.price_at_signal || 0,
+          status: 'open', openedAt: new Date(),
+        });
       }
     } catch (error: unknown) {
-        let msg = "An unknown error occurred";
-        if (error instanceof Error) msg = error.message;
-        console.error(`\n❌ [TRADE FAILED]`, { message: msg, rawError: error });
-        await logTradeToFirestore({ /* error log data */ });
-        throw error;
+      let msg = "An unknown error occurred";
+      if (error instanceof Error) msg = error.message;
+      console.error(`\n❌ [TRADE FAILED]`, { message: msg, rawError: error });
+      await logTradeToFirestore({
+        tokenAddress, solAmount: action.toUpperCase() === 'BUY' ? amountInput : null,
+        action: action.toUpperCase(), date: new Date(), status: 'Failed', error: msg,
+      });
+      throw error;
     }
   }
 };
