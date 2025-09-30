@@ -10,6 +10,7 @@ import bs58 from "bs58";
 const JUP_BASE = process.env.JUPITER_BASE_URL || "https://quote-api.jup.ag";
 const DEFAULT_SLIPPAGE_BPS = Number(process.env.DEFAULT_SLIPPAGE_BPS || 50);
 const CUP_DEFAULT = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS || 0);
+const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS || 45000);
 
 export type ExecArgs = {
   connection: Connection;
@@ -79,36 +80,57 @@ async function jupSwap(args: {
   if (!data.swapTransaction) throw new Error("swap build empty");
   return data as {
     swapTransaction: string; // base64
-    blockhash?: string;
-    lastValidBlockHeight?: number;
   };
 }
 
-async function sendAndConfirm(
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForConfirmation(
   connection: Connection,
-  tx: VersionedTransaction,
-  blockhash?: string,
-  lastValidBlockHeight?: number
+  signature: string,
+  timeoutMs: number
 ) {
-  const sig = await connection.sendRawTransaction(tx.serialize(), {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const st = await connection.getSignatureStatuses([signature], {
+      searchTransactionHistory: true,
+    });
+    const s = st.value[0];
+
+    if (s?.err) throw new Error(`on-chain error: ${JSON.stringify(s.err)}`);
+    const conf = s?.confirmationStatus;
+    if (conf === "confirmed" || conf === "finalized") return;
+
+    await sleep(1000);
+  }
+  throw new Error("confirmation timeout");
+}
+
+async function buildSignSendConfirm(
+  connection: Connection,
+  wallet: Keypair,
+  quote: any,
+  cuPriceMicroLamports?: number
+) {
+  const swapResp = await jupSwap({
+    userPublicKey: wallet.publicKey.toBase58(),
+    quoteResponse: quote,
+    cuPriceMicroLamports,
+  });
+
+  const raw = Buffer.from(swapResp.swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(raw);
+  tx.sign([wallet]);
+
+  const signature = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false,
     maxRetries: 2,
   });
 
-  let bh = blockhash;
-  let lvbh = lastValidBlockHeight;
-  if (!bh || !lvbh) {
-    const info = await connection.getLatestBlockhash("finalized");
-    bh = info.blockhash;
-    lvbh = info.lastValidBlockHeight;
-  }
-
-  await connection.confirmTransaction(
-    { signature: sig, blockhash: bh!, lastValidBlockHeight: lvbh! },
-    "confirmed"
-  );
-
-  return sig;
+  await waitForConfirmation(connection, signature, CONFIRM_TIMEOUT_MS);
+  return signature;
 }
 
 async function executeOnce({
@@ -127,21 +149,11 @@ async function executeOnce({
     slippageBps: slippageBps ?? DEFAULT_SLIPPAGE_BPS,
   });
 
-  const swapResp = await jupSwap({
-    userPublicKey: wallet.publicKey.toBase58(),
-    quoteResponse: quote,
-    cuPriceMicroLamports: cuPriceMicroLamports ?? CUP_DEFAULT,
-  });
-
-  const raw = Buffer.from(swapResp.swapTransaction, "base64");
-  const tx = VersionedTransaction.deserialize(raw);
-  tx.sign([wallet]);
-
-  const signature = await sendAndConfirm(
+  const signature = await buildSignSendConfirm(
     connection,
-    tx,
-    swapResp.blockhash,
-    swapResp.lastValidBlockHeight
+    wallet,
+    quote,
+    cuPriceMicroLamports ?? CUP_DEFAULT
   );
 
   return {
@@ -152,27 +164,46 @@ async function executeOnce({
   };
 }
 
+function isStaleOrExpiredError(msg: string) {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("block height exceeded") ||
+    m.includes("expired") ||
+    m.includes("blockhash not found") ||
+    m.includes("was not processed in the given time") ||
+    m.includes("confirmation timeout")
+  );
+}
+
 export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
   try {
     return await executeOnce(args);
   } catch (e: any) {
-    const msg = String(e?.message || "");
+    const msg = String(e?.message || e);
     const logs = e?.logs || e?.value?.logs;
     if (logs) console.error("[sendTx logs]\n" + logs.join("\n"));
 
-    // stale route / price moved / Jupiter Custom:6001
-    if (
+    // stale route / sim fail → re-quote + bump
+    const isSimFail =
       msg.includes("Simulation failed") ||
       msg.includes("custom program error: 0x1771") ||
-      msg.includes("Custom:6001")
-    ) {
+      msg.includes("Custom:6001");
+
+    // blockhash/expiry/timeouts → re-quote + bump
+    const isExpiry = isStaleOrExpiredError(msg);
+
+    if (isSimFail || isExpiry) {
       const bumpSlippage = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 50;
-      const bumpCup = Math.round(
-        (args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2
+      const bumpCup = Math.max(
+        Math.round((args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2),
+        (args.cuPriceMicroLamports ?? CUP_DEFAULT) + 5_000 // add at least +5k microLamports
       );
+
       console.warn(
-        `[executor] retrying with slippageBps=${bumpSlippage}, cu=${bumpCup}`
+        `[executor] retry: reason="${msg}", slippageBps=${bumpSlippage}, cu=${bumpCup}`
       );
+
+      // Re-quote fresh and resend
       return await executeOnce({
         ...args,
         slippageBps: bumpSlippage,
