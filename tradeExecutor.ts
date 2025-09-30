@@ -66,7 +66,6 @@ async function performSwap(
     outputMint,
     amount,
     slippageBps,
-    priorityFeeLevel: 'MEDIUM', // High, Medium, Low, or 'DEFAULT'
     onlyDirectRoutes: false,
     asLegacyTransaction: false, // Important: Use modern VersionedTransactions
   });
