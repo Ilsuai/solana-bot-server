@@ -105,14 +105,14 @@ async function jupSwapTx(params: {
   quote: any;
   userPubkey: PublicKey;
   slippageBps: number;
-  prioritizationFeeLamports: number;
+  cuPriceMicroLamports: number; // <— use CUP only (mutually exclusive with prioritizationFeeLamports)
 }) {
   const body = {
     quoteResponse: params.quote,
     userPublicKey: params.userPubkey.toBase58(),
     slippageBps: params.slippageBps,
-    prioritizationFeeLamports: params.prioritizationFeeLamports,
-    computeUnitPriceMicroLamports: params.prioritizationFeeLamports,
+    // IMPORTANT: send ONLY computeUnitPriceMicroLamports (remove prioritizationFeeLamports)
+    computeUnitPriceMicroLamports: params.cuPriceMicroLamports,
     wrapAndUnwrapSol: true,
     dynamicComputeUnitLimit: true,
   };
@@ -170,7 +170,7 @@ export async function executeSwap(args: {
     quote,
     userPubkey: walletPubkey,
     slippageBps,
-    prioritizationFeeLamports: PRIORITY_FEE_MICRO_LAMPORTS,
+    cuPriceMicroLamports: PRIORITY_FEE_MICRO_LAMPORTS, // <— single CUP knob
   });
 
   const sig = await sendAndConfirm(swapTx);

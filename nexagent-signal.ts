@@ -346,6 +346,10 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   } catch (err: any) {
     const msg = String(err?.message || err);
     await markFailed(signalId, dir, msg).catch(() => {});
+
+    const memKey = `${signalId}:${dir}`;
+    seenInMemory.delete(memKey);
+
     console.error("🟥 [nexagent-signal] Handler failed", msg);
     return res.status(500).json({ ok: false, error: msg });
   }
