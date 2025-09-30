@@ -1,7 +1,6 @@
 // server/tradeExecutor.ts
 import {
   Connection,
-  PublicKey,
   VersionedTransaction,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -17,7 +16,7 @@ export type ExecArgs = {
   wallet: Keypair;
   fromMint: string;
   toMint: string;
-  amountMinor: string; // already in smallest units for fromMint
+  amountMinor: string;          // amount for the INPUT mint in smallest units
   slippageBps?: number;
   cuPriceMicroLamports?: number;
 };
@@ -40,7 +39,7 @@ async function jupQuote(args: {
   url.searchParams.set("outputMint", args.outputMint);
   url.searchParams.set("amount", args.amount);
   url.searchParams.set("slippageBps", String(args.slippageBps));
-  // Optional tuning:
+  // sane defaults
   url.searchParams.set("onlyDirectRoutes", "false");
   url.searchParams.set("maxAccounts", "64");
 
@@ -61,8 +60,7 @@ async function jupSwap(args: {
     wrapAndUnwrapSol: true,
     useSharedAccounts: true,
     dynamicComputeUnitLimit: true,
-    // Versioned tx by default; avoids legacy tx limits
-    asLegacyTransaction: false,
+    asLegacyTransaction: false, // request a v0 tx
     computeUnitPriceMicroLamports: args.cuPriceMicroLamports,
     quoteResponse: args.quoteResponse,
   };
@@ -79,7 +77,11 @@ async function jupSwap(args: {
   }
   const data = await res.json();
   if (!data.swapTransaction) throw new Error("swap build empty");
-  return data;
+  return data as {
+    swapTransaction: string; // base64
+    blockhash?: string;
+    lastValidBlockHeight?: number;
+  };
 }
 
 async function sendAndConfirm(
@@ -88,13 +90,11 @@ async function sendAndConfirm(
   blockhash?: string,
   lastValidBlockHeight?: number
 ) {
-  // Send
   const sig = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false,
     maxRetries: 2,
   });
 
-  // Confirm
   let bh = blockhash;
   let lvbh = lastValidBlockHeight;
   if (!bh || !lvbh) {
@@ -102,6 +102,7 @@ async function sendAndConfirm(
     bh = info.blockhash;
     lvbh = info.lastValidBlockHeight;
   }
+
   await connection.confirmTransaction(
     { signature: sig, blockhash: bh!, lastValidBlockHeight: lvbh! },
     "confirmed"
@@ -136,7 +137,7 @@ async function executeOnce({
   const tx = VersionedTransaction.deserialize(raw);
   tx.sign([wallet]);
 
-  const sig = await sendAndConfirm(
+  const signature = await sendAndConfirm(
     connection,
     tx,
     swapResp.blockhash,
@@ -144,18 +145,13 @@ async function executeOnce({
   );
 
   return {
-    signature: sig,
+    signature,
     outAmount: quote.outAmount,
     inAmount: quote.inAmount,
     priceImpactPct: quote.priceImpactPct,
   };
 }
 
-/**
- * Public entry:
- * - Single path for BUY or SELL. Caller gives `amountMinor` for the *input* mint.
- * - On simulation error / 6001, re-quote once with slightly higher slippage and CUP.
- */
 export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
   try {
     return await executeOnce(args);
@@ -164,14 +160,16 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
     const logs = e?.logs || e?.value?.logs;
     if (logs) console.error("[sendTx logs]\n" + logs.join("\n"));
 
-    // Retry on simulation-related failures
+    // stale route / price moved / Jupiter Custom:6001
     if (
       msg.includes("Simulation failed") ||
-      msg.includes("custom program error: 0x1771") || // Jupiter Custom:6001 in hex
+      msg.includes("custom program error: 0x1771") ||
       msg.includes("Custom:6001")
     ) {
       const bumpSlippage = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 50;
-      const bumpCup = Math.round((args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2);
+      const bumpCup = Math.round(
+        (args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2
+      );
       console.warn(
         `[executor] retrying with slippageBps=${bumpSlippage}, cu=${bumpCup}`
       );
@@ -186,7 +184,7 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
   }
 }
 
-/** Helpers for callers */
+// helpers
 export const toLamports = (sol: number | string) =>
   BigInt(Math.round(Number(sol) * LAMPORTS_PER_SOL)).toString();
 
