@@ -8,20 +8,35 @@ dotenv.config();
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-const WALLET_PRIVATE_KEY = process.env.PRIVATE_KEY;
-if (!WALLET_PRIVATE_KEY) throw new Error("PRIVATE_KEY is missing from the .env file.");
-const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
+// --- ROBUST WALLET INITIALIZATION ---
+// This handles both Base58 string and the array format from your brother's code.
+function initializeWallet(): Keypair {
+    const privateKey = process.env.PRIVATE_KEY;
+    if (!privateKey) throw new Error("PRIVATE_KEY environment variable is not set.");
+    try {
+        // Try parsing as a JSON array of numbers first
+        return Keypair.fromSecretKey(new Uint8Array(JSON.parse(privateKey)));
+    } catch (e) {
+        try {
+            // Fallback to Base58 string decoding
+            return Keypair.fromSecretKey(bs58.decode(privateKey));
+        } catch (error) {
+            throw new Error("Failed to initialize wallet. Invalid PRIVATE_KEY format. Must be a Base58 string or a JSON array of numbers.");
+        }
+    }
+}
+const walletKeypair = initializeWallet();
 
 const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, "confirmed");
 
-// Helper function to get token decimals
+// Helper to get token decimals from the blockchain
 async function getTokenDecimals(mint: string): Promise<number> {
-  if (mint === SOL_MINT) return 9;
-  const mintPublicKey = new PublicKey(mint);
-  const mintInfo = await getMint(connection, mintPublicKey);
-  return mintInfo.decimals;
+    if (mint === SOL_MINT) return 9;
+    const mintPublicKey = new PublicKey(mint);
+    const mintInfo = await getMint(connection, mintPublicKey);
+    return mintInfo.decimals;
 }
 
 // Main exported function
@@ -37,33 +52,34 @@ module.exports = {
       
       console.log(`⚙️ [Executor] Starting ${action} trade for ${amountInput} of ${inputMint}`);
 
-      // 1. Get Quote using direct fetch
-      console.log('⚙️ [Executor] Fetching quote from Jupiter API...');
-      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=1500`; // 15% slippage
+      // 1. Get Quote using direct fetch to Jupiter v6 API
+      const slippageBps = 1500; // Using a high 15% slippage for volatile tokens
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}`;
+      console.log(`⚙️ [Executor] Fetching quote from URL: ${quoteUrl}`);
       const quoteResponse = await fetch(quoteUrl);
       if (!quoteResponse.ok) {
-        throw new Error(`Failed to get quote: ${await quoteResponse.text()}`);
+        const errorBody = await quoteResponse.text();
+        throw new Error(`Failed to get quote: ${quoteResponse.status} - ${errorBody}`);
       }
       const quote = await quoteResponse.json();
+      console.log('✅ [Executor] Successfully fetched quote.');
 
       // 2. Get Serialized Transaction using direct fetch
       console.log('⚙️ [Executor] Fetching swap transaction...');
       const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           quoteResponse: quote,
           userPublicKey: walletKeypair.publicKey.toBase58(),
           wrapAndUnwrapSol: true,
         })
       });
-
       if (!swapResponse.ok) {
         throw new Error(`Failed to get swap transaction: ${await swapResponse.text()}`);
       }
       const { swapTransaction, lastValidBlockHeight } = await swapResponse.json();
+      console.log('✅ [Executor] Successfully fetched swap transaction.');
 
       // 3. Sign and Send Transaction
       const txBuffer = Buffer.from(swapTransaction, 'base64');
@@ -71,10 +87,7 @@ module.exports = {
       tx.sign([walletKeypair]);
       console.log('⚙️ [Executor] Transaction signed. Sending...');
 
-      const signature = await connection.sendRawTransaction(tx.serialize(), {
-        skipPreflight: true,
-        maxRetries: 5,
-      });
+      const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
 
       // 4. Confirm Transaction
       await connection.confirmTransaction({
