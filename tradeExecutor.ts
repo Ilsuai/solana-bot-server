@@ -86,7 +86,7 @@ async function getTokenDecimals(mintAddress: string): Promise<number> {
 
 async function handleTradeSignal(signal: { token_address: string, action: string, amount_input: number }): Promise<{ signature: string, quote: QuoteResponse }> {
     const { token_address, action, amount_input } = signal;
-    const slippageBps = 350; // 3.5% Slippage
+    const slippageBps = 350;
     const isBuy = action.toUpperCase() === 'BUY';
     
     const inputMint = isBuy ? SOL_MINT : token_address;
@@ -132,9 +132,8 @@ async function handleTradeSignal(signal: { token_address: string, action: string
         maxRetries: 2,
     });
 
-    // --- THIS IS THE FIX ---
     await connection.confirmTransaction({
-        blockhash: transaction.message.recentBlockhash, // Corrected 'recentBlockhash'
+        blockhash: transaction.message.recentBlockhash,
         lastValidBlockHeight: lastValidBlockHeight,
         signature: txSignature
     }, 'confirmed');
@@ -163,21 +162,28 @@ export async function executeTrade(tokenAddress: string, action: string, amountI
             
             await managePosition({
                 txid: signature,
-                tokenAddress: tokenAddress,
-                tokenSymbol: signalData.token_symbol || 'Unknown',
+                tokenSymbol: signalData?.token_symbol || 'Unknown',
                 solAmount: amountInput,
                 tokenAmount: tokensReceived,
-                entryPrice: signalData.price_at_signal || 0,
+                entryPrice: signalData?.price_at_signal || 0,
                 status: 'open',
                 openedAt: new Date(),
-                stopLossPrice: signalData.stop_loss_limit || 0, 
+                stopLossPrice: signalData?.stop_loss_limit || 0, 
             });
         }
     } catch (error: unknown) {
         let errorMessage = "An unknown error occurred";
-        if (error instanceof Error) errorMessage = error.message;
+        if (error instanceof Error) {
+            errorMessage = error.message;
+        }
         
-        console.error(`\n❌ [TRADE FAILED]`, errorMessage);
+        // --- ENHANCED ERROR LOGGING ---
+        // Log the full error object to get more details.
+        console.error(`\n❌ [TRADE FAILED]`, {
+            message: errorMessage,
+            rawError: error 
+        });
+        
         await logTradeToFirestore({
             tokenAddress, solAmount: action === 'BUY' ? amountInput : null, 
             action: action.toUpperCase(),
