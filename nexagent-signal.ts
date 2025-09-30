@@ -27,7 +27,7 @@ const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: { symbol: "USDC", decimals: 6 },
 };
 
-// Pretty helpers
+// Pretty helpers (used in log lines)
 const toUi = (minor?: string, decimals?: number) =>
   !minor || decimals == null ? null : Number(minor) / 10 ** decimals;
 const fmt = (n: number | null | undefined, dp = 6) =>
@@ -53,7 +53,11 @@ async function reserveEvent(key: string) {
     ts: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
-async function completeEvent(key: string, status: "SUCCESS" | "SKIPPED" | "FAILED", data: any) {
+async function completeEvent(
+  key: string,
+  status: "SUCCESS" | "SKIPPED" | "FAILED",
+  data: any
+) {
   const ref = db.collection("signal_events").doc(key);
   await ref.set(
     { status, data, doneAt: admin.firestore.FieldValue.serverTimestamp() },
@@ -92,9 +96,9 @@ type AgentTx = {
   outputMint?: string;
   outputAmount?: number;
   amountSOL?: number;
-  signalId?: string;     // allow string to match Nexgent ids
+  signalId?: string; // allow string to match Nexgent ids
   slippageBps?: number;
-  raw?: any;             // keep for debugging
+  raw?: any; // keep for debugging
 };
 
 function parseBody(req: Request): any {
@@ -129,7 +133,7 @@ function normalize(raw: any): AgentTx {
   const agentId = b.agentId ?? d.agentId ?? d.agent_id ?? null;
   const agentWallet = b.agentWallet ?? b.wallet ?? d.wallet ?? d.payer ?? d.owner ?? null;
 
-  // 2) direction
+  // 2) direction (more aliases + transaction_* names)
   const dir =
     toSide(b.dir) ||
     toSide(b.direction) ||
@@ -137,7 +141,9 @@ function normalize(raw: any): AgentTx {
     toSide(d.direction) ||
     toSide(d.side) ||
     toSide(d.trade_side) ||
-    toSide(d.trade_action);
+    toSide(d.trade_action) ||
+    toSide(d.transaction_side) ||
+    toSide(d.transaction_direction);
 
   // 3) mints (look in several shapes; Nexgent often nests under swap/swap_data/transaction)
   const s = d.swap || d.swap_data || d.transaction || d.txn || d.trade || d.details || {};
@@ -166,7 +172,7 @@ function normalize(raw: any): AgentTx {
     s.to_token_mint ||
     s.quote_mint;
 
-  // 4) amounts (UI units)
+  // 4) amounts (UI) — include Nexgent's `transaction_amount`
   const inputAmount =
     b.inputAmount ??
     d.inputAmount ??
@@ -177,7 +183,8 @@ function normalize(raw: any): AgentTx {
     s.ui_amount_in ??
     d.uiAmount ??
     d.amount ??
-    (d.sol_amount ?? s.sol_amount); // sometimes present for SOL buys
+    d.transaction_amount ?? // <— common in Nexgent payloads
+    s.transaction_amount;
 
   const outputAmount =
     b.outputAmount ??
@@ -193,8 +200,24 @@ function normalize(raw: any): AgentTx {
 
   // 5) id / slippage
   const signalId =
-    (b.signalId ?? d.signalId ?? b.id ?? d.id ?? b.signal_id ?? d.signal_id ?? b.tradeId ?? d.tradeId) != null
-      ? String(b.signalId ?? d.signalId ?? b.id ?? d.id ?? b.signal_id ?? d.signal_id ?? b.tradeId ?? d.tradeId)
+    (b.signalId ??
+      d.signalId ??
+      b.id ??
+      d.id ??
+      b.signal_id ??
+      d.signal_id ??
+      b.tradeId ??
+      d.tradeId) != null
+      ? String(
+          b.signalId ??
+            d.signalId ??
+            b.id ??
+            d.id ??
+            b.signal_id ??
+            d.signal_id ??
+            b.tradeId ??
+            d.tradeId
+        )
       : undefined;
 
   const slippageBps =
@@ -254,23 +277,45 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   }
 
   const raw = parseBody(req);
-  const body = normalize(raw);
+  let body = normalize(raw);
+
+  // --- Heuristics to fill missing fields ---
+  let finalBody: AgentTx = { ...body };
+
+  // If dir missing, infer from mints
+  if (!finalBody.dir && finalBody.inputMint && finalBody.outputMint) {
+    if (finalBody.inputMint === SOL_MINT && finalBody.outputMint !== SOL_MINT) {
+      finalBody.dir = "BUY";
+    } else if (finalBody.outputMint === SOL_MINT && finalBody.inputMint !== SOL_MINT) {
+      finalBody.dir = "SELL";
+    }
+  }
+
+  // If it's a BUY-from-SOL and amountSOL missing but inputAmount present, copy it
+  if (
+    finalBody.dir === "BUY" &&
+    finalBody.inputMint === SOL_MINT &&
+    !Number.isFinite(finalBody.amountSOL as any) &&
+    Number.isFinite(finalBody.inputAmount as any)
+  ) {
+    finalBody.amountSOL = Number(finalBody.inputAmount);
+  }
 
   console.log("[nexagent-signal] RX", {
-    dir: body.dir,
-    inputMint: body.inputMint,
-    outputMint: body.outputMint,
-    inputAmount: body.inputAmount,
-    amountSOL: body.amountSOL,
-    signalId: body.signalId,
+    dir: finalBody.dir,
+    inputMint: finalBody.inputMint,
+    outputMint: finalBody.outputMint,
+    inputAmount: finalBody.inputAmount,
+    amountSOL: finalBody.amountSOL,
+    signalId: finalBody.signalId,
   });
 
   // If this is obviously a "signal" (analytics) without swap details, just ignore politely.
   const txnType =
-    raw?.transaction_type || raw?.data?.transaction_type || raw?.data?.type || body.event;
+    raw?.transaction_type || raw?.data?.transaction_type || raw?.data?.type || finalBody.event;
   if (
-    (!body.dir || !body.inputMint || !body.outputMint) &&
-    (txnType === "swap" || body.event === "tradeSignals" || body.event === "agentTransactions")
+    (!finalBody.dir || !finalBody.inputMint || !finalBody.outputMint) &&
+    (txnType === "swap" || finalBody.event === "tradeSignals" || finalBody.event === "agentTransactions")
   ) {
     const preview =
       typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
@@ -284,7 +329,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   }
 
   // Validate BEFORE idempotency/DB
-  const valid = validateRequired(body);
+  const valid = validateRequired(finalBody);
   if (!valid.ok) {
     const preview =
       typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
@@ -292,20 +337,20 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     return res.status(200).json({ ok: true, ignored: true, reason: valid.error });
   }
 
-  const dir = body.dir as "BUY" | "SELL";
-  const inputMint = body.inputMint!;
-  const outputMint = body.outputMint!;
-  const signalId = String(body.signalId);
-  const slippageBps = body.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+  const dir = finalBody.dir as "BUY" | "SELL";
+  const inputMint = finalBody.inputMint!;
+  const outputMint = finalBody.outputMint!;
+  const signalId = String(finalBody.signalId);
+  const slippageBps = finalBody.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
 
   // Min amount guards (avoid Jupiter 400s)
   if (dir === "BUY" && inputMint === SOL_MINT) {
-    const ui = Number(body.amountSOL ?? body.inputAmount ?? 0);
+    const ui = Number(finalBody.amountSOL ?? finalBody.inputAmount ?? 0);
     if (!Number.isFinite(ui) || ui < 0.01)
       return res.status(200).json({ ok: true, ignored: true, reason: "BUY too small (<0.01 SOL)" });
   }
   if (dir === "SELL") {
-    const ui = Number(body.inputAmount ?? 0);
+    const ui = Number(finalBody.inputAmount ?? 0);
     if (!Number.isFinite(ui) || ui < 0.1)
       return res.status(200).json({ ok: true, ignored: true, reason: "SELL too small (<0.10)" });
   }
@@ -313,8 +358,8 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   // ---- Idempotency key (allows same signalId multiple times) ----
   const roundedUiAmount =
     inputMint === SOL_MINT
-      ? Number((Number(body.amountSOL ?? body.inputAmount) || 0).toFixed(9))
-      : Number((Number(body.inputAmount) || 0).toFixed(9));
+      ? Number((Number(finalBody.amountSOL ?? finalBody.inputAmount) || 0).toFixed(9))
+      : Number((Number(finalBody.inputAmount) || 0).toFixed(9));
 
   const eventKey = hashEventKey({
     signalId,
@@ -361,12 +406,12 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     let inUiAmount = 0;
 
     if (inputMint === SOL_MINT) {
-      inUiAmount = Number(body.amountSOL ?? body.inputAmount ?? 0);
+      inUiAmount = Number(finalBody.amountSOL ?? finalBody.inputAmount ?? 0);
       amountMinor = toLamports(inUiAmount);
     } else {
       const decimals =
         TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
-      inUiAmount = Number(body.inputAmount ?? 0);
+      inUiAmount = Number(finalBody.inputAmount ?? 0);
       amountMinor = BigInt(Math.round(inUiAmount * 10 ** decimals)).toString();
     }
 
@@ -406,7 +451,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
       restrictIntermediates: exec.restrictIntermediates,
       cuPriceMicroLamports: CUP,
       idempotencyKey: eventKey,
-      rawSnippet: JSON.stringify(body.raw).slice(0, 240),
+      rawSnippet: JSON.stringify(finalBody.raw).slice(0, 240),
     });
 
     await completeEvent(eventKey, "SUCCESS", { signature: exec.signature });
