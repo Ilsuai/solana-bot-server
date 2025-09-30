@@ -84,15 +84,17 @@ async function getMintDecimals(mint: string): Promise<number> {
 type AgentTx = {
   event?: string;
   ts?: string;
-  agentWallet?: string;
+  agentId?: string | null;
+  agentWallet?: string | null;
   dir?: "BUY" | "SELL";
   inputMint?: string;
   inputAmount?: number; // UI units
   outputMint?: string;
   outputAmount?: number;
   amountSOL?: number;
-  signalId?: number | string;
+  signalId?: string;     // allow string to match Nexgent ids
   slippageBps?: number;
+  raw?: any;             // keep for debugging
 };
 
 function parseBody(req: Request): any {
@@ -107,50 +109,123 @@ function parseBody(req: Request): any {
   return {};
 }
 
-// try to map many possible field names Nexgent might use
+const isMint = (v: any) => typeof v === "string" && v.length >= 32 && v.length <= 64; // loose
+const toSide = (v: any): "BUY" | "SELL" | undefined => {
+  if (!v) return undefined;
+  const s = String(v).toLowerCase();
+  if (s === "buy" || s === "long") return "BUY";
+  if (s === "sell" || s === "short") return "SELL";
+  return undefined;
+};
+
+// Try to map many possible field names; supports nested `data.*`
 function normalize(raw: any): AgentTx {
   const b = raw || {};
+  const d = b.data || b.payload || b.eventData || {};
 
-  const dir = b.dir || b.direction || b.side || b.action;
-  const inputMint = b.inputMint || b.fromMint || b.baseMint || b.mintIn || b.input_token_mint;
-  const outputMint = b.outputMint || b.toMint || b.quoteMint || b.mintOut || b.output_token_mint;
+  // 1) basic identity/time
+  const event = b.event || b.type || d.event || "agentTransactions";
+  const ts = b.ts || b.timestamp || d.ts || d.timestamp || new Date().toISOString();
+  const agentId = b.agentId ?? d.agentId ?? d.agent_id ?? null;
+  const agentWallet = b.agentWallet ?? b.wallet ?? d.wallet ?? d.payer ?? d.owner ?? null;
 
+  // 2) direction
+  const dir =
+    toSide(b.dir) ||
+    toSide(b.direction) ||
+    toSide(d.dir) ||
+    toSide(d.direction) ||
+    toSide(d.side) ||
+    toSide(d.trade_side) ||
+    toSide(d.trade_action);
+
+  // 3) mints (look in several shapes; Nexgent often nests under swap/swap_data/transaction)
+  const s = d.swap || d.swap_data || d.transaction || d.txn || d.trade || d.details || {};
+
+  const inputMint =
+    b.inputMint ||
+    b.fromMint ||
+    d.inputMint ||
+    d.fromMint ||
+    d.input_mint ||
+    d.from_token_mint ||
+    s.input_mint ||
+    s.from_mint ||
+    s.from_token_mint ||
+    s.base_mint;
+
+  const outputMint =
+    b.outputMint ||
+    b.toMint ||
+    d.outputMint ||
+    d.toMint ||
+    d.output_mint ||
+    d.to_token_mint ||
+    s.output_mint ||
+    s.to_mint ||
+    s.to_token_mint ||
+    s.quote_mint;
+
+  // 4) amounts (UI units)
   const inputAmount =
     b.inputAmount ??
-    b.amountIn ??
-    b.amount ??
-    b.size ??
-    b.uiAmount ??
-    b.quantity ??
-    b.qty;
+    d.inputAmount ??
+    d.amountIn ??
+    d.amount_in ??
+    s.amount_in ??
+    s.input_amount ??
+    s.ui_amount_in ??
+    d.uiAmount ??
+    d.amount ??
+    (d.sol_amount ?? s.sol_amount); // sometimes present for SOL buys
 
-  const outputAmount = b.outputAmount ?? b.amountOut ?? b.out ?? undefined;
-  const amountSOL = b.amountSOL ?? b.solAmount ?? b.sol_in ?? undefined;
+  const outputAmount =
+    b.outputAmount ??
+    d.outputAmount ??
+    d.amountOut ??
+    d.amount_out ??
+    s.amount_out ??
+    s.output_amount ??
+    s.ui_amount_out;
 
-  const signalId = b.signalId ?? b.id ?? b.signal_id ?? b.tradeId ?? b.txId ?? undefined;
+  const amountSOL =
+    b.amountSOL ?? d.amountSOL ?? d.sol_in ?? d.solAmount ?? s.sol_in ?? s.sol_amount;
+
+  // 5) id / slippage
+  const signalId =
+    (b.signalId ?? d.signalId ?? b.id ?? d.id ?? b.signal_id ?? d.signal_id ?? b.tradeId ?? d.tradeId) != null
+      ? String(b.signalId ?? d.signalId ?? b.id ?? d.id ?? b.signal_id ?? d.signal_id ?? b.tradeId ?? d.tradeId)
+      : undefined;
+
   const slippageBps =
-    Number.isFinite(b.slippageBps) ? b.slippageBps : b.slippage ?? b.slippage_bps ?? undefined;
+    Number.isFinite(b.slippageBps) ? b.slippageBps :
+    Number.isFinite(d.slippageBps) ? d.slippageBps :
+    Number.isFinite(d.slippage) ? d.slippage :
+    Number.isFinite(s.slippage_bps) ? s.slippage_bps :
+    undefined;
 
   return {
-    event: b.event || b.type || "agentTransactions",
-    ts: b.ts || b.timestamp || new Date().toISOString(),
-    agentWallet: b.agentWallet || b.wallet || b.payer || b.owner,
-    dir,
+    event,
+    ts,
+    agentId,
+    agentWallet,
+    dir: dir as any,
     inputMint,
     outputMint,
     inputAmount: inputAmount != null ? Number(inputAmount) : undefined,
     outputAmount: outputAmount != null ? Number(outputAmount) : undefined,
     amountSOL: amountSOL != null ? Number(amountSOL) : undefined,
-    signalId: signalId != null ? String(signalId) : undefined,
+    signalId,
     slippageBps: slippageBps != null ? Number(slippageBps) : undefined,
+    raw: raw,
   };
 }
 
 function validateRequired(p: AgentTx): { ok: true } | { ok: false; error: string } {
   const missing: string[] = [];
   if (!p.dir) missing.push("dir");
-  if (!p.inputMint) missing.push("inputMint");
-  if (!p.outputMint) missing.push("outputMint");
+  if (!isMint(p.inputMint)) missing.push("inputMint");
+  if (!isMint(p.outputMint)) missing.push("outputMint");
   if (!Number.isFinite(p.inputAmount ?? NaN) && !Number.isFinite(p.amountSOL ?? NaN)) {
     missing.push("inputAmount/amountSOL");
   }
@@ -162,7 +237,7 @@ function validateRequired(p: AgentTx): { ok: true } | { ok: false; error: string
       error:
         "Missing required fields: " +
         missing.join(", ") +
-        ". Ensure JSON payload includes dir, inputMint, outputMint, inputAmount (or amountSOL), and signalId.",
+        ". Ensure JSON includes dir, inputMint, outputMint, inputAmount (or amountSOL), and signalId.",
     };
   }
   return { ok: true };
@@ -190,13 +265,31 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     signalId: body.signalId,
   });
 
-  // Validate before idempotency/DB
+  // If this is obviously a "signal" (analytics) without swap details, just ignore politely.
+  const txnType =
+    raw?.transaction_type || raw?.data?.transaction_type || raw?.data?.type || body.event;
+  if (
+    (!body.dir || !body.inputMint || !body.outputMint) &&
+    (txnType === "swap" || body.event === "tradeSignals" || body.event === "agentTransactions")
+  ) {
+    const preview =
+      typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
+    console.warn("[nexagent-signal] Ignored (no actionable swap fields)", { preview });
+    // Return 200 so we don't keep erroring for non-executable signals
+    return res.status(200).json({
+      ok: true,
+      ignored: true,
+      reason: "no actionable swap fields (waiting for detailed payload)",
+    });
+  }
+
+  // Validate BEFORE idempotency/DB
   const valid = validateRequired(body);
   if (!valid.ok) {
     const preview =
-      typeof raw === "string" ? raw.slice(0, 200) : JSON.stringify(raw).slice(0, 200);
+      typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
     console.warn("[nexagent-signal] Bad payload", { error: valid.error, preview });
-    return res.status(400).json({ ok: false, error: valid.error });
+    return res.status(200).json({ ok: true, ignored: true, reason: valid.error });
   }
 
   const dir = body.dir as "BUY" | "SELL";
@@ -209,16 +302,15 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   if (dir === "BUY" && inputMint === SOL_MINT) {
     const ui = Number(body.amountSOL ?? body.inputAmount ?? 0);
     if (!Number.isFinite(ui) || ui < 0.01)
-      return res.status(400).json({ ok: false, error: "Amount too small for BUY; use ≥ 0.01 SOL" });
+      return res.status(200).json({ ok: true, ignored: true, reason: "BUY too small (<0.01 SOL)" });
   }
   if (dir === "SELL") {
     const ui = Number(body.inputAmount ?? 0);
     if (!Number.isFinite(ui) || ui < 0.1)
-      return res.status(400).json({ ok: false, error: "Amount too small for SELL; use ≥ 0.10" });
+      return res.status(200).json({ ok: true, ignored: true, reason: "SELL too small (<0.10)" });
   }
 
-  // ---- New idempotency key (allows same signalId multiple times) ----
-  // Round amount slightly so tiny float diffs don't create duplicates unintentionally
+  // ---- Idempotency key (allows same signalId multiple times) ----
   const roundedUiAmount =
     inputMint === SOL_MINT
       ? Number((Number(body.amountSOL ?? body.inputAmount) || 0).toFixed(9))
@@ -314,6 +406,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
       restrictIntermediates: exec.restrictIntermediates,
       cuPriceMicroLamports: CUP,
       idempotencyKey: eventKey,
+      rawSnippet: JSON.stringify(body.raw).slice(0, 240),
     });
 
     await completeEvent(eventKey, "SUCCESS", { signature: exec.signature });
