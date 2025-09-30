@@ -11,3 +11,9 @@
 service-account-key.json
 # macOS
 .DS_Store
+node_modules
+dist
+build
+.env
+.env.*
+service-account-key.json

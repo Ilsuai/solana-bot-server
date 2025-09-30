@@ -1,6 +1,7 @@
 // server/index.ts
 import "dotenv/config";
 import express from "express";
+import type { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import admin from "firebase-admin";
 import "./firebaseAdmin";
@@ -10,15 +11,17 @@ import { randomUUID } from "crypto";
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
+// CORS + parsers
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // tiny request log
-app.use((req, _res, next) => {
+app.use((req: Request, _res: Response, next: NextFunction) => {
   console.log(`➡️  ${req.method} ${req.path}`);
   next();
 });
 
+// lightweight logger
 const L = {
   info: (scope: string, msg: string, meta?: any) =>
     console.log(`🟦 [${scope}] ${msg}`, meta ?? ""),
@@ -31,7 +34,7 @@ const L = {
 const db = () => admin.firestore();
 
 // Health
-app.get("/healthz", async (_req, res) => {
+app.get("/healthz", async (_req: Request, res: Response) => {
   try {
     await db().collection("settings").doc("bot-settings").get();
     L.info("healthz", "OK");
@@ -43,12 +46,14 @@ app.get("/healthz", async (_req, res) => {
 });
 
 // ✅ START BOT (server authoritative; creates session + logs)
-app.post("/bot/start", async (req, res) => {
+app.post("/bot/start", async (req: Request, res: Response) => {
   const scope = "bot-start";
   try {
     // accept either "startingBalance" or "sessionStartingBalance" from client
     const raw =
-      req.body?.startingBalance ?? req.body?.sessionStartingBalance ?? 0;
+      (req.body as any)?.startingBalance ??
+      (req.body as any)?.sessionStartingBalance ??
+      0;
     const starting = Number(raw);
     if (!Number.isFinite(starting) || starting <= 0) {
       return res
@@ -59,7 +64,7 @@ app.post("/bot/start", async (req, res) => {
     const sessionId = randomUUID();
     const now = admin.firestore.FieldValue.serverTimestamp();
 
-    // Match the exact field names your dashboard expects
+    // keep exact field names your dashboard expects
     await db().collection("settings").doc("bot-settings").set(
       {
         botStatus: "RUNNING",
@@ -80,7 +85,7 @@ app.post("/bot/start", async (req, res) => {
 });
 
 // 🛑 STOP & ARCHIVE (closes opens and turns bot OFF)
-app.post("/bot/stop-and-archive", async (_req, res) => {
+app.post("/bot/stop-and-archive", async (_req: Request, res: Response) => {
   const scope = "stop-and-archive";
   try {
     const now = admin.firestore.FieldValue.serverTimestamp();
@@ -114,8 +119,22 @@ app.post("/bot/stop-and-archive", async (_req, res) => {
   }
 });
 
-// Nexgent webhook (POST /nexagent-signal)
+// Nexagent webhook (POST /nexagent-signal)
 app.use("/", nexagentRouter);
+
+// 404
+app.use((req: Request, res: Response) => {
+  res.status(404).json({ ok: false, error: "Not found", path: req.path });
+});
+
+// Error handler (must have 4 params)
+app.use(
+  (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    L.error("server", "Unhandled error", msg);
+    res.status(500).json({ ok: false, error: msg || "Internal Server Error" });
+  }
+);
 
 app.listen(PORT, () => {
   console.log(`🚀 server listening on port ${PORT}`);
