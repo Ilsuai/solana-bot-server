@@ -39,11 +39,11 @@ async function performSwap(
   amount: number,
   slippageBps: number
 ): Promise<{ txid: string; quote: QuoteResponse }> {
-  console.log(`[Swap] Getting quote from Jupiter...`);
+  console.log(`[Swap] Getting quote from Jupiter with priority fees...`);
 
   const priorityFee = process.env.PRIORITY_FEE_MICRO_LAMPORTS
     ? parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS, 10)
-    : 50000;
+    : 50000; // Default priority fee
 
   const quote = await jupiterApi.quoteGet({
     inputMint,
@@ -136,7 +136,6 @@ export async function executeTrade(
 
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
-            // Re-introducing detailed error logging
             if (error.response && typeof error.response.json === 'function') {
                 try {
                     const errorBody = await error.response.json();
