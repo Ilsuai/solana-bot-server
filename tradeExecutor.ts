@@ -57,7 +57,6 @@ async function jupQuote(args: {
     "onlyDirectRoutes",
     (args.opts?.onlyDirectRoutes ?? false) ? "true" : "false"
   );
-  // Reduces risky hops that often fail (Jupiter tip)
   if (args.opts?.restrictIntermediateTokens != null) {
     url.searchParams.set(
       "restrictIntermediateTokens",
@@ -66,7 +65,11 @@ async function jupQuote(args: {
   }
 
   const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`quote failed ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    // include body for debugging
+    throw new Error(`quote failed ${res.status}: ${text}`);
+  }
   const data = await res.json();
   if (!data || !data.outAmount) throw new Error("quote empty");
   return data;
@@ -81,7 +84,7 @@ async function jupSwap(args: {
   const body = {
     userPublicKey: args.userPublicKey,
     wrapAndUnwrapSol: true,
-    useSharedAccounts: args.useSharedAccounts ?? true, // we may turn this off on fallback
+    useSharedAccounts: args.useSharedAccounts ?? true, // may turn off on fallback
     dynamicComputeUnitLimit: true,
     asLegacyTransaction: false, // v0
     computeUnitPriceMicroLamports: args.cuPriceMicroLamports,
@@ -162,14 +165,13 @@ async function executeOnce({
   slippageBps,
   cuPriceMicroLamports,
   useSharedAccounts,
-}: ExecArgs & { quoteOpts?: QuoteOpts }): Promise<ExecResult> {
+}: ExecArgs): Promise<ExecResult> {
   const quote = await jupQuote({
     inputMint: fromMint,
     outputMint: toMint,
     amount: amountMinor,
     slippageBps: slippageBps ?? DEFAULT_SLIPPAGE_BPS,
     opts: {
-      // first attempt: allow aggregator freedom (not too restrictive)
       onlyDirectRoutes: false,
       restrictIntermediateTokens: false,
       maxAccounts: 64,
@@ -203,8 +205,14 @@ function isStaleOrExpiredError(msg: string) {
   );
 }
 
+function isJup1771or6001(msg: string) {
+  return msg.includes("custom program error: 0x1771") || msg.includes("Custom:6001");
+}
 function isJup1788(msg: string) {
-  return msg.includes("custom program error: 0x1788") || msg.includes("SharedAccountsRoute");
+  return msg.includes("custom program error: 0x1788") || msg.includes("SharedAccountsRoute") || msg.includes("Instruction: Route");
+}
+function isQuote400(msg: string) {
+  return msg.includes("quote failed 400");
 }
 
 export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
@@ -216,15 +224,42 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
     const logs = e?.logs || e?.value?.logs;
     if (logs) console.error("[sendTx logs]\n" + logs.join("\n"));
 
-    const isSimFail =
-      msg.includes("Simulation failed") ||
-      msg.includes("custom program error: 0x1771") || // slippage exceeded
-      msg.includes("Custom:6001");
-
+    const isSimFail = msg.includes("Simulation failed") || isJup1771or6001(msg);
     const isExpiry = isStaleOrExpiredError(msg);
     const is1788 = isJup1788(msg);
+    const isQ400 = isQuote400(msg);
 
-    // -------- Fallback #1 (we already had): no shared accounts + bump fees/slippage
+    // -------- Fallback #1: quote 400 → try simpler route (direct-only)
+    if (isQ400) {
+      const bumpSlip = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 25;
+      console.warn(`[executor] retry#Q400: direct-only quote, slippageBps=${bumpSlip}`);
+      const quote2 = await jupQuote({
+        inputMint: args.fromMint,
+        outputMint: args.toMint,
+        amount: args.amountMinor,
+        slippageBps: bumpSlip,
+        opts: {
+          onlyDirectRoutes: true,
+          restrictIntermediateTokens: true,
+          maxAccounts: 64,
+        },
+      });
+      const sig2 = await buildSignSendConfirm(
+        args.connection,
+        args.wallet,
+        quote2,
+        args.cuPriceMicroLamports ?? CUP_DEFAULT,
+        args.useSharedAccounts ?? true
+      );
+      return {
+        signature: sig2,
+        outAmount: quote2.outAmount,
+        inAmount: quote2.inAmount,
+        priceImpactPct: quote2.priceImpactPct,
+      };
+    }
+
+    // -------- Fallback #2: Jupiter route/composition fail or expiry/sim → no-shared + bumps
     if (isSimFail || isExpiry || is1788) {
       const bumpSlippage = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 50;
       const bumpCup = Math.max(
@@ -237,38 +272,36 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
         console.warn(
           `[executor] retry#1: reason="${msg}", slippageBps=${bumpSlippage}, cu=${bumpCup}, useShared=false`
         );
-        return await (async () => {
-          const quote = await jupQuote({
-            inputMint: args.fromMint,
-            outputMint: args.toMint,
-            amount: args.amountMinor,
-            slippageBps: bumpSlippage,
-            opts: {
-              onlyDirectRoutes: false,
-              restrictIntermediateTokens: false,
-              maxAccounts: 64,
-            },
-          });
-          const sig = await buildSignSendConfirm(
-            args.connection,
-            args.wallet,
-            quote,
-            bumpCup,
-            false
-          );
-          return {
-            signature: sig,
-            outAmount: quote.outAmount,
-            inAmount: quote.inAmount,
-            priceImpactPct: quote.priceImpactPct,
-          };
-        })();
+        const quote = await jupQuote({
+          inputMint: args.fromMint,
+          outputMint: args.toMint,
+          amount: args.amountMinor,
+          slippageBps: bumpSlippage,
+          opts: {
+            onlyDirectRoutes: false,
+            restrictIntermediateTokens: false,
+            maxAccounts: 64,
+          },
+        });
+        const sig = await buildSignSendConfirm(
+          args.connection,
+          args.wallet,
+          quote,
+          bumpCup,
+          false
+        );
+        return {
+          signature: sig,
+          outAmount: quote.outAmount,
+          inAmount: quote.inAmount,
+          priceImpactPct: quote.priceImpactPct,
+        };
       } catch (e2: any) {
         const msg2 = String(e2?.message || e2);
         const logs2 = e2?.logs || e2?.value?.logs;
         if (logs2) console.error("[sendTx logs]\n" + logs2.join("\n"));
 
-        // -------- Fallback #2: force **simplest route** (direct only + restrict intermediates)
+        // -------- Fallback #3: direct-only + restricted + bumps
         if (isJup1788(msg2) || isSimFail) {
           const bumpAgain = bumpSlippage + 25;
           const cupAgain = bumpCup + 5_000;
@@ -304,6 +337,7 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
       }
     }
 
+    // otherwise, bubble up
     throw e;
   }
 }
