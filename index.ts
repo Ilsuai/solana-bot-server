@@ -1,7 +1,9 @@
-const express = require('express');
+console.log("--- RUNNING LATEST CODE - v_FINAL_COMMONJS_RESET ---");
+console.log("--- If you see this, the new deployment is working. ---");
+
+import express, { Request, Response } from 'express';
 const cors = require('cors');
 const dotenv = require('dotenv');
-import { Request, Response } from 'express'; // Keep this for types
 
 const { executeTrade } = require('./tradeExecutor');
 const {

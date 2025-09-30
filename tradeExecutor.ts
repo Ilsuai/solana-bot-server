@@ -13,7 +13,11 @@ const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_PRIVATE_KEY));
 const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, 'confirmed');
+
+console.log("--- INITIALIZING JUPITER API CLIENT ---");
+console.log("--- CONFIGURING WITH V6 ENDPOINT: https://quote-api.jup.ag/v6 ---");
 const jupiterApi = createJupiterApiClient({ basePath: "https://quote-api.jup.ag/v6" });
+
 
 async function getPriorityFee(): Promise<number> {
   const minFee = 25000; const maxFee = 1000000;
