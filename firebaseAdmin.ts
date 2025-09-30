@@ -1,14 +1,13 @@
 import admin from 'firebase-admin';
 
-// Use require for CommonJS modules
-const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
-  : require('./service-account-key.json');
-
 let db: admin.firestore.Firestore;
 
 export function initializeFirebase() {
   try {
+    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
+      : require('./service-account-key.json');
+
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
@@ -20,24 +19,35 @@ export function initializeFirebase() {
   }
 }
 
-// ... all other functions remain the same
 export async function logTradeToFirestore(tradeData: any) {
   if (!db) return;
-  try { await db.collection('trades').add(tradeData); } 
-  catch (error) { console.error('Failed to log trade:', error); }
+  try {
+    await db.collection('trades').add(tradeData);
+  } catch (error) {
+    console.error('Failed to log trade:', error);
+  }
 }
+
 export async function getBotSettings() {
   if (!db) return null;
   try {
     const doc = await db.collection('settings').doc('bot-settings').get();
     return doc.exists ? doc.data() : null;
-  } catch (error) { console.error('Failed to fetch bot settings:', error); return null; }
+  } catch (error) {
+    console.error('Failed to fetch bot settings:', error);
+    return null;
+  }
 }
+
 export async function managePosition(positionData: any) {
   if (!db) return;
-  try { await db.collection('positions').doc(positionData.txid).set(positionData, { merge: true }); } 
-  catch (error) { console.error('Failed to manage position:', error); }
+  try {
+    await db.collection('positions').doc(positionData.txid).set(positionData, { merge: true });
+  } catch (error) {
+    console.error('Failed to manage position:', error);
+  }
 }
+
 export async function getOpenPositionByToken(tokenAddress: string): Promise<any | null> {
   if (!db) return null;
   try {
@@ -45,13 +55,22 @@ export async function getOpenPositionByToken(tokenAddress: string): Promise<any 
     if (snapshot.empty) return null;
     const doc = snapshot.docs[0];
     return { id: doc.id, ...doc.data() };
-  } catch (error) { console.error(`Failed to fetch open position for ${tokenAddress}:`, error); return null; }
+  } catch (error) {
+    console.error(`Failed to fetch open position for ${tokenAddress}:`, error);
+    return null;
+  }
 }
+
 export async function closePosition(docId: string, sellPrice: number, reason: string | null): Promise<void> {
   if (!db) return;
   try {
     await db.collection('positions').doc(docId).update({
-      status: 'closed', sellPrice, closedAt: new Date(), deactivationReason: reason || 'Unknown'
+      status: 'closed',
+      sellPrice,
+      closedAt: new Date(),
+      deactivationReason: reason || 'Unknown'
     });
-  } catch (error) { console.error(`Failed to close position ${docId}:`, error); }
+  } catch (error) {
+    console.error(`Failed to close position ${docId}:`, error);
+  }
 }

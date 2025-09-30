@@ -18,11 +18,17 @@ const jupiterApi = createJupiterApiClient({ basePath: "https://quote-api.jup.ag/
 async function getPriorityFee(): Promise<number> {
   const minFee = 25000; const maxFee = 1000000;
   try {
-    const fees = await connection.getRecentPrioritizationFees();
-    if (fees.length === 0) return minFee;
-    const recentFees = fees.map((f: any) => f.prioritizationFee).filter((f: number) => f <= maxFee);
-    if (recentFees.length === 0) return minFee;
-    recentFees.sort((a: number, b: number) => a - b);
+    const fees: any[] = await connection.getRecentPrioritizationFees();
+    if (fees.length === 0) {
+      console.log("💸 [Fee] No recent priority fees found, using minimum.");
+      return minFee;
+    }
+    const recentFees: number[] = fees.map(f => f.prioritizationFee).filter(f => f <= maxFee);
+    if (recentFees.length === 0) {
+      console.log("💸 [Fee] No recent fees within a reasonable range, using minimum.");
+      return minFee;
+    }
+    recentFees.sort((a, b) => a - b);
     const p95 = recentFees[Math.floor(recentFees.length * 0.95)];
     const finalFee = Math.max(p95 + 1, minFee);
     console.log(`💸 [Fee] Aggressive fee: ${finalFee} microLamports`);
@@ -37,7 +43,7 @@ async function getTokenDecimals(mint: string): Promise<number> {
   return mintInfo.decimals;
 }
 
-async function handleTradeSignal(signal: { token_address: string; action: string; amount_input: number; }) {
+async function handleTradeSignal(signal: { token_address: string; action: string; amount_input: number; }): Promise<{ signature: string; quote: any; }> {
   const { token_address, action, amount_input } = signal;
   const slippageBps = 350; // 3.5%
   const isBuy = action.toUpperCase() === 'BUY';
@@ -46,25 +52,17 @@ async function handleTradeSignal(signal: { token_address: string; action: string
   const inputDecimals = await getTokenDecimals(inputMint);
   const amountInSmallestUnits = Math.round(amount_input * (10 ** inputDecimals));
   if (amountInSmallestUnits <= 0) throw new Error(`Invalid amount: ${amount_input}`);
-  
   console.log(`⚙️  [Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
-
-  console.log('⚙️  [Executor] Manually building and fetching quote from V6 API...');
-  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
   
-  const quoteResponse = await fetch(quoteUrl);
-  if (!quoteResponse.ok) {
-    const errorBody = await quoteResponse.text();
-    throw new Error(`Failed to fetch quote: ${quoteResponse.status} ${quoteResponse.statusText} - ${errorBody}`);
-  }
-  const quote = await quoteResponse.json();
-  if (!quote) throw new Error('Failed to get a valid quote from Jupiter.');
-
+  const quote = await jupiterApi.quoteGet({
+    inputMint, outputMint, amount: amountInSmallestUnits, slippageBps, onlyDirectRoutes: false,
+  });
+  if (!quote) throw new Error('Failed to get quote.');
   console.log('⚙️  [Executor] Got quote from Jupiter.');
 
   const { swapTransaction, lastValidBlockHeight } = await jupiterApi.swapPost({
     swapRequest: {
-      quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(),
+      quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase5a(),
       wrapUnwrapSol: true, computeUnitPriceMicroLamports: await getPriorityFee(),
     },
   });

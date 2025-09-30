@@ -10,8 +10,8 @@
   },
   "dependencies": {
     "@jup-ag/api": "^6.0.0",
-    "@solana/spl-token": "^0.4.0",
-    "@solana/web3.js": "^1.91.4",
+    "@solana/spl-token": "^0.4.6",
+    "@solana/web3.js": "^1.91.7",
     "bs58": "^5.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

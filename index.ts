@@ -1,6 +1,3 @@
-console.log("--- RUNNING LATEST CODE - v_FINAL_COMMONJS_RESET ---");
-console.log("--- If you see this, the new deployment is working. ---");
-
 import express, { Request, Response } from 'express';
 const cors = require('cors');
 const dotenv = require('dotenv');
@@ -11,7 +8,6 @@ const {
   getBotSettings,
   getOpenPositionByToken,
   closePosition,
-  logTradeToFirestore
 } = require('./firebaseAdmin');
 
 dotenv.config();
@@ -34,7 +30,6 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid trade signal payload' });
   }
   
-  // The rest of the logic remains the same...
   if (processedSignals.has(signalId)) {
     console.log(`🗑️ [Duplicate Signal] Skipping signalId: ${signalId}`);
     return res.status(200).json({ message: 'Duplicate signal, ignored.' });
