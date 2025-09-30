@@ -4,13 +4,17 @@ import {
   VersionedTransaction,
   Keypair,
   LAMPORTS_PER_SOL,
+  SignatureStatus,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 
 const JUP_BASE = process.env.JUPITER_BASE_URL || "https://quote-api.jup.ag";
 const DEFAULT_SLIPPAGE_BPS = Number(process.env.DEFAULT_SLIPPAGE_BPS || 50);
-const CUP_DEFAULT = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS || 0);
-const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS || 45_000);
+
+// ↑ Raise default CUP + timeout to reduce timeouts under load.
+// (You can override with env on Render.)
+const CUP_DEFAULT = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS || 50_000);
+const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS || 90_000);
 
 export type ExecArgs = {
   connection: Connection;
@@ -112,22 +116,44 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// --- Smarter confirmation: poll; if timeout, do final late-landing checks ---
 async function waitForConfirmation(
   connection: Connection,
   signature: string,
   timeoutMs: number
 ) {
   const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
+
+  async function statusOk(): Promise<boolean> {
     const st = await connection.getSignatureStatuses([signature], {
       searchTransactionHistory: true,
     });
-    const s = st.value[0];
+    const s: SignatureStatus | null | undefined = st.value[0];
     if (s?.err) throw new Error(`on-chain error: ${JSON.stringify(s.err)}`);
     const conf = s?.confirmationStatus;
-    if (conf === "confirmed" || conf === "finalized") return;
-    await sleep(1_000);
+    return conf === "confirmed" || conf === "finalized";
   }
+
+  while (Date.now() - started < timeoutMs) {
+    if (await statusOk()) return;
+    await sleep(1000);
+  }
+
+  // Final double-checks before giving up:
+  // 1) One more status read (sometimes lands just after our loop)
+  if (await statusOk()) return;
+
+  // 2) Try fetching the actual tx; handle v0 with maxSupportedTransactionVersion
+  try {
+    const tx = await connection.getTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: "confirmed",
+    } as any);
+    if (tx) return; // landed
+  } catch {
+    // ignore; we'll throw below
+  }
+
   throw new Error("confirmation timeout");
 }
 
@@ -182,7 +208,7 @@ function isQuote400(msg: string) {
   return msg.includes("quote failed 400");
 }
 
-async function tryOnce(args: {
+type TryOnceArgs = {
   connection: Connection;
   wallet: Keypair;
   fromMint: string;
@@ -193,25 +219,27 @@ async function tryOnce(args: {
   useSharedAccounts: boolean;
   directOnly: boolean;
   restrictIntermediates: boolean;
-}): Promise<ExecResult> {
+};
+
+async function tryOnce(a: TryOnceArgs): Promise<ExecResult> {
   const quote = await jupQuote({
-    inputMint: args.fromMint,
-    outputMint: args.toMint,
-    amount: args.amountMinor,
-    slippageBps: args.slippageBps,
+    inputMint: a.fromMint,
+    outputMint: a.toMint,
+    amount: a.amountMinor,
+    slippageBps: a.slippageBps,
     opts: {
-      onlyDirectRoutes: args.directOnly,
-      restrictIntermediateTokens: args.restrictIntermediates,
+      onlyDirectRoutes: a.directOnly,
+      restrictIntermediateTokens: a.restrictIntermediates,
       maxAccounts: 64,
     },
   });
 
   const signature = await buildSignSendConfirm(
-    args.connection,
-    args.wallet,
+    a.connection,
+    a.wallet,
     quote,
-    args.cuPriceMicroLamports,
-    args.useSharedAccounts
+    a.cuPriceMicroLamports,
+    a.useSharedAccounts
   );
 
   return {
@@ -219,10 +247,10 @@ async function tryOnce(args: {
     outAmount: quote.outAmount,
     inAmount: quote.inAmount,
     priceImpactPct: quote.priceImpactPct,
-    usedSlippageBps: args.slippageBps,
-    usedSharedAccounts: args.useSharedAccounts,
-    routeDirectOnly: args.directOnly,
-    restrictIntermediates: args.restrictIntermediates,
+    usedSlippageBps: a.slippageBps,
+    usedSharedAccounts: a.useSharedAccounts,
+    routeDirectOnly: a.directOnly,
+    restrictIntermediates: a.restrictIntermediates,
   };
 }
 
@@ -254,7 +282,7 @@ export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
     const is1788 = isJup1788(msg);
     const isQ400 = isQuote400(msg);
 
-    // Attempt #2 — handle quote 400 with direct-only
+    // Attempt #2 — quote 400 → direct-only quote
     if (isQ400) {
       const slip = baseSlip + 25;
       console.warn(`[executor] retry#Q400: direct-only quote, slippageBps=${slip}`);
