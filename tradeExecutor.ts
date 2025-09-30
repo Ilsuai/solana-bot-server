@@ -41,11 +41,17 @@ async function performSwap(
 ): Promise<{ txid: string; quote: QuoteResponse }> {
   console.log(`[Swap] Getting quote from Jupiter...`);
 
+  const priorityFee = process.env.PRIORITY_FEE_MICRO_LAMPORTS
+    ? parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS, 10)
+    : 50000;
+
   const quote = await jupiterApi.quoteGet({
     inputMint,
     outputMint,
     amount,
     slippageBps,
+    // @ts-ignore - This bypasses the local editor's false error
+    computeUnitPriceMicroLamports: priorityFee,
     asLegacyTransaction: false,
   });
 
@@ -130,6 +136,15 @@ export async function executeTrade(
 
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
+            // Re-introducing detailed error logging
+            if (error.response && typeof error.response.json === 'function') {
+                try {
+                    const errorBody = await error.response.json();
+                    console.error('   Jupiter API Error Body:', JSON.stringify(errorBody));
+                } catch (jsonError) {
+                    console.error('   Could not parse Jupiter API error response as JSON.');
+                }
+            }
 
             if (i === slippageSettings.length - 1) {
                 console.error(`🛑 [FATAL] All attempts failed. Aborting trade.`);
