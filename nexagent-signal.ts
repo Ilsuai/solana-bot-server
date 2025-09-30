@@ -1,6 +1,10 @@
 // server/nexagent-signal.ts
 import { Router, Request, Response } from "express";
-import { Connection } from "@solana/web3.js";
+import {
+  Connection,
+  PublicKey,
+  ParsedAccountData,
+} from "@solana/web3.js";
 import admin from "./firebaseAdmin"; // env-driven initializer
 import { executeSwap, toLamports, loadKeypairFromEnv } from "./tradeExecutor";
 
@@ -15,11 +19,10 @@ const CUP = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS || 0);
 // Mints
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Simple token registry for clean logs (extend as you like)
+// Simple token registry for clean logs (extend as needed)
 const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   [SOL_MINT]: { symbol: "SOL", decimals: 9 },
   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: { symbol: "USDC", decimals: 6 },
-  // add more here if you want pretty logs for them
 };
 
 // Utils for pretty logs
@@ -48,7 +51,7 @@ type AgentTx = {
   agentWallet: string;
   dir: "BUY" | "SELL";
   inputMint: string;
-  inputAmount: number; // UI units (e.g., SOL)
+  inputAmount: number; // UI units (e.g., SOL or token UI)
   outputMint: string;
   outputAmount: number;
   amountSOL: number; // duplicate SOL amount for BUYs
@@ -56,7 +59,9 @@ type AgentTx = {
   slippageBps: number;
 };
 
-// --- Persistence helpers (durable idempotency) ---
+// ---- Helpers ----
+
+// Durable idempotency
 async function reserveSignal(id: string) {
   const ref = db.collection("signal_events").doc(id);
   await ref.create({
@@ -64,7 +69,6 @@ async function reserveSignal(id: string) {
     ts: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
-
 async function completeSignal(
   id: string,
   status: "SUCCESS" | "SKIPPED" | "FAILED",
@@ -72,15 +76,10 @@ async function completeSignal(
 ) {
   const ref = db.collection("signal_events").doc(id);
   await ref.set(
-    {
-      status,
-      data,
-      doneAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
+    { status, data, doneAt: admin.firestore.FieldValue.serverTimestamp() },
     { merge: true }
   );
 }
-
 function logTrade(doc: Record<string, any>) {
   return db.collection("trades").add({
     ...doc,
@@ -88,7 +87,25 @@ function logTrade(doc: Record<string, any>) {
   });
 }
 
-// --- Route ---
+// On-chain decimals lookup (works for SPL Token & Token-2022)
+async function getMintDecimals(mint: string): Promise<number> {
+  const pk = new PublicKey(mint);
+
+  // Try parsed first (fast & robust)
+  const parsed = await connection.getParsedAccountInfo(pk);
+  const decParsed =
+    (parsed.value?.data as ParsedAccountData | undefined)?.parsed?.info?.decimals;
+  if (typeof decParsed === "number") return decParsed;
+
+  // Fallback: raw layout; decimals is a single byte at offset 44
+  const acc = await connection.getAccountInfo(pk);
+  if (!acc || acc.data.length < 45) {
+    throw new Error("mint account not found or too small");
+  }
+  return acc.data[44];
+}
+
+// ---- Route ----
 router.post("/nexagent-signal", async (req: Request, res: Response) => {
   const body = req.body as AgentTx;
 
@@ -156,15 +173,16 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   try {
     // Compute input amount in *minor units* for the input mint
     let amountMinor: string;
+
     if (inputMint === SOL_MINT) {
       // BUY path (SOL is input)
       amountMinor = toLamports(amountSOL || inputAmount || 0);
     } else {
-      // SELL path (token is input) – placeholder decimals (before enabling SELL, replace with on-chain decimals)
-      const assumedDecimals = 6;
-      amountMinor = BigInt(
-        Math.round(Number(inputAmount) * 10 ** assumedDecimals)
-      ).toString();
+      // SELL path (token is input) – use on-chain decimals
+      const decimals = TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
+      const ui = Number(inputAmount || 0);
+      if (!Number.isFinite(ui) || ui <= 0) throw new Error("invalid inputAmount");
+      amountMinor = BigInt(Math.round(ui * 10 ** decimals)).toString();
     }
 
     const exec = await executeSwap({
@@ -193,7 +211,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
 
     await completeSignal(signalKey, "SUCCESS", { signature: exec.signature });
 
-    // ---- Pretty success LOG (this is what you asked for) ----
+    // Pretty success log
     const inSym = TOKENS[inputMint]?.symbol ?? `${inputMint.slice(0, 4)}…`;
     const outSym = TOKENS[outputMint]?.symbol ?? `${outputMint.slice(0, 4)}…`;
     const outUi = toUi(exec.outAmount, TOKENS[outputMint]?.decimals);
@@ -208,7 +226,6 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     console.log(
       `🟩 [trade] ${dir} ${fmt(inUi)} ${inSym} → ~${fmt(outUi)} ${outSym} | slip=${slippageBps ?? DEFAULT_SLIPPAGE_BPS}bps cu=${CUP}µ | impact=${impactPct} | sig=${exec.signature}`
     );
-    // ---------------------------------------------------------
 
     return res.json({ ok: true, signature: exec.signature });
   } catch (e: any) {
