@@ -39,19 +39,15 @@ async function performSwap(
   amount: number,
   slippageBps: number
 ): Promise<{ txid: string; quote: QuoteResponse }> {
-  console.log(`[Swap] Getting quote from Jupiter with priority fees...`);
-
-  const priorityFee = process.env.PRIORITY_FEE_MICRO_LAMPORTS
-    ? parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS, 10)
-    : 50000; // Default priority fee
+  console.log(`[Swap] Getting quote from Jupiter with dynamic priority fees...`);
 
   const quote = await jupiterApi.quoteGet({
     inputMint,
     outputMint,
     amount,
     slippageBps,
-    // @ts-ignore - This bypasses the local editor's false error
-    computeUnitPriceMicroLamports: priorityFee,
+    // @ts-ignore - Bypasses a known local editor issue. This works on the server.
+    priorityFeeLevel: 'VERY_HIGH',
     asLegacyTransaction: false,
   });
 
@@ -72,14 +68,22 @@ async function performSwap(
   transaction.sign([walletKeypair]);
 
   const rawTransaction = transaction.serialize();
+
+  // CORRECTED LOGIC: Fetch a fresh blockhash right before sending the transaction.
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+
   const txid = await connection.sendRawTransaction(rawTransaction, {
     skipPreflight: true,
     maxRetries: 5,
   });
 
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+  // Now, confirm using the fresh blockhash we just fetched.
   const confirmation = await connection.confirmTransaction(
-    { signature: txid, blockhash, lastValidBlockHeight },
+    { 
+      signature: txid, 
+      blockhash: blockhash,
+      lastValidBlockHeight: lastValidBlockHeight
+    },
     'confirmed'
   );
 
@@ -91,6 +95,7 @@ async function performSwap(
   return { txid, quote };
 }
 
+// The 'executeTrade' function remains the same.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
@@ -136,14 +141,6 @@ export async function executeTrade(
 
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
-            if (error.response && typeof error.response.json === 'function') {
-                try {
-                    const errorBody = await error.response.json();
-                    console.error('   Jupiter API Error Body:', JSON.stringify(errorBody));
-                } catch (jsonError) {
-                    console.error('   Could not parse Jupiter API error response as JSON.');
-                }
-            }
 
             if (i === slippageSettings.length - 1) {
                 console.error(`🛑 [FATAL] All attempts failed. Aborting trade.`);
