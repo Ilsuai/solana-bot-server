@@ -20,6 +20,7 @@ export type ExecArgs = {
   amountMinor: string;          // amount for the INPUT mint in smallest units
   slippageBps?: number;
   cuPriceMicroLamports?: number;
+  useSharedAccounts?: boolean;  // default true; fallback to false on 0x1788
 };
 
 export type ExecResult = {
@@ -55,13 +56,14 @@ async function jupSwap(args: {
   userPublicKey: string;
   quoteResponse: any;
   cuPriceMicroLamports?: number;
+  useSharedAccounts?: boolean;
 }) {
   const body = {
     userPublicKey: args.userPublicKey,
     wrapAndUnwrapSol: true,
-    useSharedAccounts: true,
+    useSharedAccounts: args.useSharedAccounts ?? true, // we may turn this off on fallback
     dynamicComputeUnitLimit: true,
-    asLegacyTransaction: false, // request a v0 tx
+    asLegacyTransaction: false, // v0
     computeUnitPriceMicroLamports: args.cuPriceMicroLamports,
     quoteResponse: args.quoteResponse,
   };
@@ -78,9 +80,7 @@ async function jupSwap(args: {
   }
   const data = await res.json();
   if (!data.swapTransaction) throw new Error("swap build empty");
-  return data as {
-    swapTransaction: string; // base64
-  };
+  return data as { swapTransaction: string };
 }
 
 function sleep(ms: number) {
@@ -98,11 +98,9 @@ async function waitForConfirmation(
       searchTransactionHistory: true,
     });
     const s = st.value[0];
-
     if (s?.err) throw new Error(`on-chain error: ${JSON.stringify(s.err)}`);
     const conf = s?.confirmationStatus;
     if (conf === "confirmed" || conf === "finalized") return;
-
     await sleep(1000);
   }
   throw new Error("confirmation timeout");
@@ -112,12 +110,14 @@ async function buildSignSendConfirm(
   connection: Connection,
   wallet: Keypair,
   quote: any,
-  cuPriceMicroLamports?: number
+  cuPriceMicroLamports?: number,
+  useSharedAccounts?: boolean
 ) {
   const swapResp = await jupSwap({
     userPublicKey: wallet.publicKey.toBase58(),
     quoteResponse: quote,
     cuPriceMicroLamports,
+    useSharedAccounts,
   });
 
   const raw = Buffer.from(swapResp.swapTransaction, "base64");
@@ -141,6 +141,7 @@ async function executeOnce({
   amountMinor,
   slippageBps,
   cuPriceMicroLamports,
+  useSharedAccounts,
 }: ExecArgs): Promise<ExecResult> {
   const quote = await jupQuote({
     inputMint: fromMint,
@@ -153,7 +154,8 @@ async function executeOnce({
     connection,
     wallet,
     quote,
-    cuPriceMicroLamports ?? CUP_DEFAULT
+    cuPriceMicroLamports ?? CUP_DEFAULT,
+    useSharedAccounts
   );
 
   return {
@@ -177,37 +179,41 @@ function isStaleOrExpiredError(msg: string) {
 
 export async function executeSwap(args: ExecArgs): Promise<ExecResult> {
   try {
-    return await executeOnce(args);
+    return await executeOnce({ ...args, useSharedAccounts: args.useSharedAccounts ?? true });
   } catch (e: any) {
     const msg = String(e?.message || e);
     const logs = e?.logs || e?.value?.logs;
     if (logs) console.error("[sendTx logs]\n" + logs.join("\n"));
 
-    // stale route / sim fail → re-quote + bump
     const isSimFail =
       msg.includes("Simulation failed") ||
       msg.includes("custom program error: 0x1771") ||
       msg.includes("Custom:6001");
 
-    // blockhash/expiry/timeouts → re-quote + bump
     const isExpiry = isStaleOrExpiredError(msg);
 
-    if (isSimFail || isExpiry) {
+    // Special: Jupiter SharedAccountsRoute failure (0x1788) → retry w/o shared accounts
+    const isSharedAccountsFail =
+      msg.includes("custom program error: 0x1788") ||
+      msg.includes("SharedAccountsRoute");
+
+    if (isSimFail || isExpiry || isSharedAccountsFail) {
       const bumpSlippage = (args.slippageBps ?? DEFAULT_SLIPPAGE_BPS) + 50;
       const bumpCup = Math.max(
         Math.round((args.cuPriceMicroLamports ?? CUP_DEFAULT) * 1.2),
-        (args.cuPriceMicroLamports ?? CUP_DEFAULT) + 5_000 // add at least +5k microLamports
+        (args.cuPriceMicroLamports ?? CUP_DEFAULT) + 5_000
       );
+      const noShared = isSharedAccountsFail ? false : (args.useSharedAccounts ?? true);
 
       console.warn(
-        `[executor] retry: reason="${msg}", slippageBps=${bumpSlippage}, cu=${bumpCup}`
+        `[executor] retry: reason="${msg}", slippageBps=${bumpSlippage}, cu=${bumpCup}, useShared=${noShared}`
       );
 
-      // Re-quote fresh and resend
       return await executeOnce({
         ...args,
         slippageBps: bumpSlippage,
         cuPriceMicroLamports: bumpCup,
+        useSharedAccounts: noShared,
       });
     }
 
