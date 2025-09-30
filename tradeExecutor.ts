@@ -10,13 +10,12 @@ import {
   SwapRequest,
 } from '@jup-ag/api';
 import { getMint } from '@solana/spl-token';
-import { logTradeToFirestore, managePosition, getOpenPositionByToken } from './firebaseAdmin';
+import { logTradeToFirestore, managePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
 
 // --- Configuration and Initialization ---
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
-// Ensure environment variables are loaded
 if (!process.env.PRIVATE_KEY) {
   throw new Error('PRIVATE_KEY is not set in the environment variables.');
 }
@@ -26,16 +25,11 @@ if (!process.env.SOLANA_RPC_ENDPOINT) {
 
 const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
-const jupiterApi = createJupiterApiClient(); // Initialize Jupiter API client
+const jupiterApi = createJupiterApiClient();
 
-/**
- * Utility function to get the number of decimals for a given token mint.
- * @param mintAddress The token's mint address.
- * @returns The number of decimals.
- */
 async function getTokenDecimals(mintAddress: string): Promise<number> {
   if (mintAddress === SOL_MINT_ADDRESS) {
-    return 9; // SOL always has 9 decimals
+    return 9;
   }
   try {
     const mintPublicKey = new PublicKey(mintAddress);
@@ -47,14 +41,6 @@ async function getTokenDecimals(mintAddress: string): Promise<number> {
   }
 }
 
-/**
- * Executes a trade (swap) on Jupiter.
- * @param inputMint The mint address of the token to sell.
- * @param outputMint The mint address of the token to buy.
- * @param amount The amount of the input token to sell, in its smallest unit (e.g., lamports).
- * @param slippageBps The slippage in basis points (e.g., 50 for 0.5%).
- * @returns The transaction signature.
- */
 async function performSwap(
   inputMint: string,
   outputMint: string,
@@ -63,21 +49,19 @@ async function performSwap(
 ): Promise<{ txid: string; quote: QuoteResponse }> {
   console.log(`[Swap] Getting quote for ${amount} of ${inputMint} -> ${outputMint} with ${slippageBps} BPS slippage.`);
 
-  // 1. Get a quote from Jupiter
   const quote = await jupiterApi.quoteGet({
     inputMint,
     outputMint,
     amount,
     slippageBps,
     onlyDirectRoutes: false,
-    asLegacyTransaction: false, // Use VersionedTransactions
+    asLegacyTransaction: false,
   });
 
   if (!quote) {
     throw new Error('Failed to get a quote from Jupiter.');
   }
 
-  // 2. Get the serialized transaction
   const swapResult = await jupiterApi.swapPost({
     swapRequest: {
       quoteResponse: quote,
@@ -86,12 +70,10 @@ async function performSwap(
     },
   });
 
-  // 3. Deserialize and sign the transaction
   const swapTransactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
   let transaction = VersionedTransaction.deserialize(swapTransactionBuf);
   transaction.sign([walletKeypair]);
 
-  // 4. Send the transaction
   const rawTransaction = transaction.serialize();
   const txid = await connection.sendRawTransaction(rawTransaction, {
     skipPreflight: true,
@@ -99,11 +81,7 @@ async function performSwap(
     preflightCommitment: 'confirmed',
   });
 
-  // 5. Confirm the transaction
-  const confirmation = await connection.confirmTransaction(
-    txid,
-    'confirmed'
-  );
+  const confirmation = await connection.confirmTransaction(txid, 'confirmed');
 
   if (confirmation.value.err) {
     throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
@@ -113,12 +91,6 @@ async function performSwap(
   return { txid, quote };
 }
 
-/**
- * Main function to handle a buy or sell signal. It includes retry logic with increasing slippage.
- * @param tokenAddress The address of the token to trade.
- * @param action 'BUY' or 'SELL'.
- * @param solAmount The amount of SOL to use for the trade.
- */
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
@@ -126,15 +98,8 @@ export async function executeTrade(
 ): Promise<void> {
     const isBuy = action === 'BUY';
     
-    // For a BUY, SOL is the input. For a SELL, the token is the input.
-    // However, since the primary logic is driven by a fixed SOL amount for buys,
-    // we will handle that case specifically. Sells will need a different logic
-    // to determine the input amount (e.g., sell 100% of the position).
-    
     if (!isBuy) {
         console.log(`[Executor] SELL logic not fully implemented yet. Signal for ${tokenAddress} ignored.`);
-        // Here you would fetch the open position to get the token balance to sell.
-        // For now, we will focus on fixing the BUY side.
         return;
     }
     
@@ -145,9 +110,9 @@ export async function executeTrade(
 
     const MAX_RETRIES = 3;
     const slippageSettings = [
-        process.env.DEFAULT_SLIPPAGE_BPS ? parseInt(process.env.DEFAULT_SLIPPAGE_BPS) : 200, // 2%
-        1000, // 10%
-        2500, // 25%
+        process.env.DEFAULT_SLIPPAGE_BPS ? parseInt(process.env.DEFAULT_SLIPPAGE_BPS, 10) : 200,
+        1000,
+        2500,
     ];
 
     for (let i = 0; i < MAX_RETRIES; i++) {
@@ -164,7 +129,6 @@ export async function executeTrade(
                 currentSlippage
             );
             
-            // On successful trade:
             const outputTokenDecimals = await getTokenDecimals(outputMint);
             const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
             
@@ -188,20 +152,29 @@ export async function executeTrade(
                 tokenAddress,
                 solSpent: solAmount,
                 tokenReceived: tokenAmountReceived,
-                buyPrice: solAmount / tokenAmountReceived, // Price per token in SOL
+                buyPrice: solAmount / tokenAmountReceived,
                 openedAt: new Date(),
             });
 
             console.log(`[Executor] Successfully logged trade and opened position for tx: ${txid}`);
-            return; // Exit loop on success
+            return;
 
-        } catch (error) {
+        } catch (error: any) { // Changed to 'any' to access error.response
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed.`);
             if (error instanceof Error) {
-                console.error(`   Error: ${error.message}`);
-            } else {
-                console.error(error);
+                console.error(`   Error Message: ${error.message}`);
             }
+            
+            // --- THIS IS THE NEW DEBUGGING CODE ---
+            if (error.response && typeof error.response.json === 'function') {
+                try {
+                    const errorBody = await error.response.json();
+                    console.error('   Jupiter API Error Body:', JSON.stringify(errorBody));
+                } catch (jsonError) {
+                    console.error('   Could not parse Jupiter API error response as JSON.');
+                }
+            }
+            // --- END NEW DEBUGGING CODE ---
 
             if (i === MAX_RETRIES - 1) {
                 console.error(`🛑 [FATAL] All ${MAX_RETRIES} attempts failed. Aborting trade.`);
@@ -214,7 +187,7 @@ export async function executeTrade(
                     reason: error instanceof Error ? error.message : 'Unknown error',
                     date: new Date(),
                 });
-                throw error; // Re-throw the final error
+                throw error;
             }
         }
     }
