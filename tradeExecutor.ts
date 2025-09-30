@@ -1,167 +1,178 @@
-// server/tradeExecutor.ts
-// Executes swaps on Solana via Jupiter v6 (Quote + Swap).
-// Exports:
-//   - executeSwap({ fromMint, toMint, amount, slippageBps? })
-//   - buyToken({ mint, amountSol })
-//   - sellToken({ mint, amountTokens })
-
 import {
+  Commitment,
   Connection,
   Keypair,
   PublicKey,
+  SendOptions,
   VersionedTransaction,
-  ParsedAccountData,
 } from "@solana/web3.js";
-import fetch from "node-fetch";
 import bs58 from "bs58";
 
-const SOL_MINT = "So11111111111111111111111111111111111111112"; // wSOL
-const JUP_BASE = process.env.JUPITER_BASE_URL || "https://quote-api.jup.ag";
+/* ---------- ENV ---------- */
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+const JUP_BASE = process.env.JUPITER_BASE_URL || "https://quote-api.jup.ag";
+const DEFAULT_SLIPPAGE_BPS = Number(process.env.DEFAULT_SLIPPAGE_BPS ?? 50);
+const PRIORITY_FEE_MICRO_LAMPORTS = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS ?? 30000);
+const CONFIRM_TIMEOUT_MS = Number(process.env.CONFIRM_TIMEOUT_MS ?? 60000);
 
-const L = {
-  info: (s: string, m: string, meta?: any) =>
-    console.log(`🟦 [executor:${s}] ${m}`, meta ?? ""),
-  warn: (s: string, m: string, meta?: any) =>
-    console.warn(`🟨 [executor:${s}] ${m}`, meta ?? ""),
-  error: (s: string, m: string, meta?: any) =>
-    console.error(`🟥 [executor:${s}] ${m}`, meta ?? ""),
-};
+/* ---------- CONNECTION & WALLET (EXPORTED) ---------- */
+export const connection = new Connection(RPC_URL, {
+  commitment: "confirmed" as Commitment,
+});
 
-// -------- wallet loading --------
-function loadKeypair(): Keypair {
-  const b58 = process.env.WALLET_PRIVATE_KEY_B58;
-  const json = process.env.WALLET_PRIVATE_KEY_JSON;
+const secret58 = process.env.WALLET_PRIVATE_KEY_B58;
+if (!secret58) throw new Error("WALLET_PRIVATE_KEY_B58 is not set");
+const secret = bs58.decode(secret58);
+const signer = Keypair.fromSecretKey(secret);
+export const walletPubkey = signer.publicKey;
 
-  if (b58) {
-    const secret = bs58.decode(b58);
-    return Keypair.fromSecretKey(secret);
+/* ---------- UTILS ---------- */
+function toMinor(amountSOL: number): string {
+  const lamports = Math.round(Number(amountSOL) * 1_000_000_000);
+  return String(lamports);
+}
+async function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForConfirmation(sig: string, timeoutMs = CONFIRM_TIMEOUT_MS) {
+  const start = Date.now();
+  const pollEvery = 1500;
+
+  while (Date.now() - start < timeoutMs) {
+    const { value } = await connection.getSignatureStatuses([sig], {
+      searchTransactionHistory: true,
+    });
+    const st = value[0];
+
+    if (st?.err) throw new Error(`Transaction failed: ${JSON.stringify(st.err)}`);
+    if (!st) {
+      await sleep(pollEvery);
+      continue;
+    }
+    if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") {
+      return st;
+    }
+    await sleep(pollEvery);
   }
-  if (json) {
-    const arr = JSON.parse(json);
-    return Keypair.fromSecretKey(Uint8Array.from(arr));
-  }
-  throw new Error("Missing wallet secret. Set WALLET_PRIVATE_KEY_B58 or WALLET_PRIVATE_KEY_JSON.");
+
+  const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
+  if (tx && !tx.meta?.err) return tx;
+
+  throw new Error(
+    `Transaction was not confirmed in ${(timeoutMs / 1000).toFixed(
+      2
+    )} seconds. It is unknown if it succeeded or failed. Check signature ${sig} on Solscan.`
+  );
 }
 
-const connection = new Connection(RPC_URL, "confirmed");
-const wallet = loadKeypair();
-L.info("init", "Loaded wallet", { pubkey: wallet.publicKey.toBase58(), rpc: RPC_URL });
+/* ---------- JUPITER HELPERS ---------- */
+async function jupQuote(params: {
+  inputMint: string;
+  outputMint: string;
+  amount: string; // lamports
+  slippageBps: number;
+}) {
+  const url =
+    `${JUP_BASE}/v6/quote` +
+    `?inputMint=${params.inputMint}` +
+    `&outputMint=${params.outputMint}` +
+    `&amount=${params.amount}` +
+    `&slippageBps=${params.slippageBps}`;
 
-// -------- helpers --------
-async function getMintDecimals(mintStr: string): Promise<number> {
-  if (mintStr === SOL_MINT) return 9;
-  const mint = new PublicKey(mintStr);
-  const acct = await connection.getParsedAccountInfo(mint, "confirmed");
-  const parsed = acct.value?.data as ParsedAccountData | undefined;
-  const decimals = parsed?.parsed?.info?.decimals;
-  if (typeof decimals === "number") return decimals;
-  L.warn("decimals", "Fallback to 9 decimals", { mint: mintStr });
-  return 9;
+  console.log("🟦 [executor:quote] Requesting quote", {
+    fromMint: params.inputMint,
+    toMint: params.outputMint,
+    amountMinor: params.amount,
+    slippageBps: params.slippageBps,
+  });
+
+  const r = await fetch(url, { method: "GET" });
+  if (!r.ok) throw new Error(`Quote HTTP ${r.status}: ${await r.text()}`);
+
+  const quote = await r.json();
+
+  console.log("🟦 [executor:quote] Got quote", {
+    outAmount: quote?.outAmount ?? quote?.bestRoute?.outAmount,
+    inAmount: quote?.inAmount ?? quote?.bestRoute?.inAmount,
+    priceImpactPct: quote?.priceImpactPct ?? quote?.bestRoute?.priceImpactPct,
+  });
+
+  return quote;
 }
 
-function toMinorUnits(amount: number, decimals: number): string {
-  const factor = Math.pow(10, decimals);
-  const v = Math.round(amount * factor);
-  return String(v);
+async function jupSwapTx(params: {
+  quote: any;
+  userPubkey: PublicKey;
+  slippageBps: number;
+  prioritizationFeeLamports: number;
+}) {
+  const body = {
+    quoteResponse: params.quote,
+    userPublicKey: params.userPubkey.toBase58(),
+    slippageBps: params.slippageBps,
+    prioritizationFeeLamports: params.prioritizationFeeLamports,
+    computeUnitPriceMicroLamports: params.prioritizationFeeLamports,
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true,
+  };
+
+  const r = await fetch(`${JUP_BASE}/v6/swap`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`Swap build HTTP ${r.status}: ${await r.text()}`);
+
+  const json = await r.json();
+  const swapB64 = json?.swapTransaction || json?.tx || json?.swap?.swapTransaction;
+  if (!swapB64) throw new Error("No swapTransaction returned by Jupiter");
+  return swapB64 as string;
 }
 
-// -------- core swap --------
-export async function executeSwap(params: {
+async function sendAndConfirm(swapTxB64: string) {
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapTxB64, "base64"));
+  tx.sign([signer]);
+
+  const opts: SendOptions = {
+    skipPreflight: false,
+    maxRetries: 8,
+    preflightCommitment: "processed",
+  };
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), opts);
+  console.log("🟦 [executor:send] Submitted transaction", { sig });
+
+  await waitForConfirmation(sig, CONFIRM_TIMEOUT_MS);
+  console.log("🟦 [executor:confirm] Transaction confirmed", { sig });
+
+  return sig;
+}
+
+/* ---------- PUBLIC (EXPORTED) ---------- */
+export async function executeSwap(args: {
   fromMint: string;
   toMint: string;
-  amount: number; // human units of the FROM mint
-  slippageBps?: number; // default 50 (0.5%)
-}): Promise<{ txSignature: string }> {
-  const { fromMint, toMint, amount } = params;
-  const slippageBps = Number(params.slippageBps ?? 50);
+  amountSOL: number;
+  slippageBps?: number;
+}) {
+  const slippageBps = Number(args.slippageBps ?? DEFAULT_SLIPPAGE_BPS);
+  const amountMinor = toMinor(args.amountSOL);
 
-  // 1) amount in minor units based on FROM mint decimals
-  const decimals = await getMintDecimals(fromMint);
-  const amountMinor = toMinorUnits(amount, decimals);
-
-  L.info("quote", "Requesting quote", { fromMint, toMint, amountMinor, slippageBps });
-
-  // 2) QUOTE (Jupiter v6 returns a single best route object)
-  const quoteUrl =
-    `${JUP_BASE}/v6/quote?` +
-    `inputMint=${fromMint}&outputMint=${toMint}&amount=${amountMinor}` +
-    `&slippageBps=${slippageBps}&onlyDirectRoutes=false&fastMode=true`;
-
-  const quoteRes = await fetch(quoteUrl);
-  if (!quoteRes.ok) {
-    const t = await quoteRes.text();
-    throw new Error(`Quote failed: HTTP ${quoteRes.status} ${t}`);
-  }
-  const quote: any = await quoteRes.json(); // <-- explicit any to avoid "unknown" TS error
-
-  if (!quote || typeof quote !== "object" || !("outAmount" in quote)) {
-    throw new Error("No usable quote returned from Jupiter.");
-  }
-
-  L.info("quote", "Got quote", {
-    outAmount: (quote as any).outAmount,
-    inAmount: (quote as any).inAmount,
-    priceImpactPct: (quote as any).priceImpactPct,
+  const quote = await jupQuote({
+    inputMint: args.fromMint,
+    outputMint: args.toMint,
+    amount: amountMinor,
+    slippageBps,
   });
 
-  // 3) SWAP: Jupiter returns a base64 transaction to sign
-  const swapRes = await fetch(`${JUP_BASE}/v6/swap`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      useSharedAccounts: true,
-      computeUnitPriceMicroLamports: 0,
-      quoteResponse: quote,
-    }),
+  const swapTx = await jupSwapTx({
+    quote,
+    userPubkey: walletPubkey,
+    slippageBps,
+    prioritizationFeeLamports: PRIORITY_FEE_MICRO_LAMPORTS,
   });
 
-  if (!swapRes.ok) {
-    const t = await swapRes.text();
-    throw new Error(`Swap build failed: HTTP ${swapRes.status} ${t}`);
-  }
-  const swapJson: any = await swapRes.json(); // <-- explicit any to avoid "unknown" TS error
-  const b64 = swapJson.swapTransaction as string;
-  if (!b64) throw new Error("No swapTransaction in response");
-
-  const raw = Buffer.from(b64, "base64");
-  const tx = VersionedTransaction.deserialize(raw);
-  tx.sign([wallet]);
-
-  // 4) Send + confirm
-  const sig = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: true,
-    maxRetries: 3,
-  });
-
-  L.info("send", "Submitted transaction", { sig });
-  await connection.confirmTransaction(sig, "confirmed");
-  L.info("confirm", "Transaction confirmed", { sig });
-
-  return { txSignature: sig };
-}
-
-// Convenience wrappers (used by webhook adapter)
-export async function buyToken(params: {
-  mint: string; // token to receive
-  amountSol: number; // SOL to spend (human)
-}): Promise<{ txSignature: string }> {
-  return executeSwap({
-    fromMint: SOL_MINT,
-    toMint: params.mint,
-    amount: params.amountSol,
-  });
-}
-
-export async function sellToken(params: {
-  mint: string; // token to sell
-  amountTokens: number; // token amount (human)
-}): Promise<{ txSignature: string }> {
-  return executeSwap({
-    fromMint: params.mint,
-    toMint: SOL_MINT,
-    amount: params.amountTokens,
-  });
+  const sig = await sendAndConfirm(swapTx);
+  return sig;
 }

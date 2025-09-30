@@ -1,301 +1,353 @@
-// server/nexagent-signal.ts
-import express from "express";
+import { Router, Request, Response } from "express";
+import { PublicKey } from "@solana/web3.js";
 import admin from "firebase-admin";
-import * as TradeExec from "./tradeExecutor";
+import { executeSwap, connection, walletPubkey } from "./tradeExecutor";
+import {
+  logTradeToFirestore,
+  managePosition,
+  closePosition,
+  getOpenPositionByToken,
+} from "./firebaseAdmin";
 
-const router = express.Router();
-
-type ExecResult = { txSignature: string };
-
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-const USE_EXECUTOR = true;
-
-async function execSwapAdapter(
-  fromMint: string,
-  toMint: string,
-  amount: number,
-  slippageBps?: number
-): Promise<ExecResult> {
-  const anyExec = TradeExec as any;
-  if (typeof anyExec.executeSwap === "function") {
-    return anyExec.executeSwap({ fromMint, toMint, amount, slippageBps });
-  }
-  if (fromMint === SOL_MINT && typeof anyExec.buyToken === "function") {
-    return anyExec.buyToken({ mint: toMint, amountSol: amount });
-  }
-  if (toMint === SOL_MINT && typeof anyExec.sellToken === "function") {
-    return anyExec.sellToken({ mint: fromMint, amountTokens: amount });
-  }
-  throw new Error(
-    "No compatible executor found. Export executeSwap({fromMint,toMint,amount,slippageBps}) or buyToken/sellToken."
-  );
-}
-
-const L = {
-  info: (s: string, m: string, meta?: any) => console.log(`🟦 [${s}] ${m}`, meta ?? ""),
-  warn: (s: string, m: string, meta?: any) => console.warn(`🟨 [${s}] ${m}`, meta ?? ""),
-  error: (s: string, m: string, meta?: any) => console.error(`🟥 [${s}] ${m}`, meta ?? ""),
-};
+/** =========================
+ *  Constants / Config
+ *  ========================= */
+const router = Router();
 const db = () => admin.firestore();
 
-function clampSlippage(bpsFromSignal?: any): number {
-  const def = Number(process.env.DEFAULT_SLIPPAGE_BPS ?? 50); // 0.50%
-  const raw = Number(bpsFromSignal ?? def);
-  // sane bounds: 0.10% .. 30%
-  return Math.max(10, Math.min(raw, 3000));
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const DEFAULT_SLIPPAGE_BPS = Number(process.env.DEFAULT_SLIPPAGE_BPS ?? 50);
+/**
+ * SELL execution is guarded until your executor supports token-input swaps.
+ * Set ENABLE_SELLS="true" on Render when you're ready to let SELLs execute.
+ */
+const ENABLE_SELLS = String(process.env.ENABLE_SELLS || "").toLowerCase() === "true";
+
+/** =========================
+ *  Types
+ *  ========================= */
+type Dir = "BUY" | "SELL";
+
+interface NexgentBody {
+  event?: string; // 'agentTransactions'
+  timestamp?: string;
+  agentId?: string;
+  data?: {
+    agent_id?: string;
+    transaction_type?: string; // 'swap'
+    transaction_amount?: number;
+    input_mint?: string;
+    input_symbol?: string;
+    input_amount?: number; // for BUY: SOL in; for SELL: token in
+    input_price?: number;
+    output_mint?: string;
+    output_symbol?: string;
+    output_amount?: number; // for BUY: token out; for SELL: SOL out
+    output_price?: number;
+    fees?: number;
+    routes?: { slippageBps?: number; [k: string]: any };
+    slippage?: number | string;
+    price_impact?: number | string;
+    signal_id?: number;
+  };
 }
 
-/**
- * POST /nexagent-signal
- */
-router.post("/nexagent-signal", async (req, res) => {
-  const scope = "nexagent-signal";
-  try {
-    let body: any = req.body;
-    if (typeof body === "string") {
-      try { body = JSON.parse(body); } catch {
-        L.warn(scope, "Ignored non-JSON body");
-        return res.status(200).json({ ok: true, note: "ignored_non_json" });
-      }
-    }
-    const d = body?.data;
-    if (!d) {
-      L.warn(scope, "Ignored: missing data object");
-      return res.status(200).json({ ok: true, note: "ignored_no_data" });
-    }
+/** =========================
+ *  Small helpers
+ *  ========================= */
+const seenInMemory = new Set<string>();
+const dedupeKey = (signalId: number | string | undefined, dir: Dir) =>
+  `${signalId ?? "na"}:${dir}`;
 
-    // Only act if bot is RUNNING
-    const setSnap = await db().collection("settings").doc("bot-settings").get();
-    const botStatus = setSnap.exists ? setSnap.data()?.botStatus : "OFF";
-    if (botStatus !== "RUNNING") {
-      L.warn(scope, "Ignored (botStatus not RUNNING)", { botStatus });
-      return res.status(200).json({ ok: true, note: "ignored_stopped" });
-    }
+function asNum(n: any, fallback = 0): number {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : fallback;
+}
 
-    // Normalize
-    const event = body?.event || "agentTransactions";
-    const timestamp = body?.timestamp ? new Date(body.timestamp) : new Date();
-    const agentId = d.agent_id || body?.agentId || null;
-    const signalId = d.signal_id ?? null;
-    const idKey = signalId != null ? String(signalId) : `sig-${Date.now()}`;
+/** =========================
+ *  Normalization
+ *  ========================= */
+function normalize(body: NexgentBody) {
+  const d = body?.data;
 
-    const txType = String(d.transaction_type || "").toLowerCase();
-    const inputMint = d.input_mint as string;
-    const inputSymbol = String(d.input_symbol || "").trim();
-    const inputAmount = Number(d.input_amount ?? 0);
-    const inputPriceUsd = Number(d.input_price ?? 0);
+  if (!d?.input_mint || !d?.output_mint) {
+    return { ok: false, reason: "Missing input_mint/output_mint" } as const;
+  }
 
-    const outputMint = d.output_mint as string;
-    const outputSymbol = String(d.output_symbol || "").trim();
-    const outputAmount = Number(d.output_amount ?? 0);
-    const outputPriceUsd = Number(d.output_price ?? 0);
+  const inputMint = new PublicKey(d.input_mint).toBase58();
+  const outputMint = new PublicKey(d.output_mint).toBase58();
 
-    const slippageBps = clampSlippage(d?.routes?.slippageBps);
-    const isClosingFlag = Boolean(d?.routes?.isClosingTransaction);
+  // BUY if input is SOL; SELL if output is SOL
+  let dir: Dir | null = null;
+  if (inputMint === SOL_MINT) dir = "BUY";
+  else if (outputMint === SOL_MINT) dir = "SELL";
 
-    const isBuyOpen =
-      txType === "swap" && inputMint === SOL_MINT && outputMint && outputMint !== SOL_MINT;
-    const isSellClose =
-      isClosingFlag ||
-      (txType === "swap" && outputMint === SOL_MINT && inputMint && inputMint !== SOL_MINT);
+  if (!dir) {
+    return { ok: false, reason: "Neither leg is SOL (unsupported path)" } as const;
+  }
 
-    L.info(scope, "RX", {
-      event,
-      ts: timestamp.toISOString(),
-      agentId,
-      dir: isBuyOpen ? "BUY" : isSellClose ? "SELL" : "UNKNOWN",
-      inputMint,
-      inputAmount,
-      outputMint,
-      outputAmount,
-      signalId,
-    });
+  const tsISO = body.timestamp ?? new Date().toISOString();
+  const signalId = d.signal_id ?? "na";
 
-    if (!isBuyOpen && !isSellClose) {
-      L.warn(scope, "Ignored: unknown direction", { txType, inputMint, outputMint, isClosingFlag });
-      return res.status(200).json({ ok: true, note: "ignored_unknown_direction" });
-    }
+  const inputAmount = asNum(d.input_amount, 0);
+  const outputAmount = asNum(d.output_amount, 0);
 
-    // 🔒 Atomic idempotency: claim this signalId; duplicates will fail with ALREADY_EXISTS and be ignored.
-    const claimRef = db().collection("ingest_dedup").doc(idKey);
-    try {
-      await claimRef.create({
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: "processing",
-        type: "nexgent_agent_tx",
-      });
-    } catch (e: any) {
-      // code 6 = ALREADY_EXISTS
-      if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message))) {
-        L.warn(scope, "Duplicate signal; skipping", { signalId: idKey });
-        return res.status(200).json({ ok: true, dedup: true });
-      }
-      throw e;
-    }
+  // Amount we will feed into the executor (currently SOL-input only):
+  const amountSOL = dir === "BUY" ? inputAmount : outputAmount;
 
-    // Keep raw for audit
-    await db().collection("nexgent_webhook_raw").doc(idKey).set(
-      { receivedAt: admin.firestore.FieldValue.serverTimestamp(), event, payload: body },
+  const slippageBps =
+    asNum(d?.routes?.slippageBps, 0) > 0
+      ? asNum(d?.routes?.slippageBps)
+      : DEFAULT_SLIPPAGE_BPS;
+
+  const tokenSymbol =
+    (dir === "BUY" ? d.output_symbol : d.input_symbol)?.toString().trim() || undefined;
+
+  return {
+    ok: true as const,
+    event: body.event,
+    tsISO,
+    agentId: body.agentId,
+    signalId,
+    dir,
+    // For BUY: from=SOL to=token; SELL: from=token to=SOL
+    fromMint: dir === "BUY" ? inputMint : inputMint,
+    toMint: dir === "BUY" ? outputMint : outputMint,
+    amountSOL, // BUY: SOL spent; SELL: SOL received (executor sells disabled unless ENABLE_SELLS=true)
+    inputAmount,
+    outputAmount,
+    tokenSymbol,
+    slippageBps,
+  };
+}
+
+/** =========================
+ *  Firestore de-dupe (persistent)
+ *  ========================= */
+async function isProcessed(signalId: number | string, dir: Dir): Promise<boolean> {
+  const id = dedupeKey(signalId, dir);
+  const snap = await db().collection("signal_events").doc(id).get();
+  if (!snap.exists) return false;
+  const s = snap.data() || {};
+  return s.status === "executed" || s.status === "in_progress";
+}
+
+async function markInProgress(signalId: number | string, dir: Dir, payload: any) {
+  const id = dedupeKey(signalId, dir);
+  await db()
+    .collection("signal_events")
+    .doc(id)
+    .set(
+      {
+        signalId: String(signalId),
+        dir,
+        status: "in_progress",
+        firstSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        attempts: admin.firestore.FieldValue.increment(1),
+        payload,
+      },
       { merge: true }
     );
+}
 
-    let execSig: string | null = null;
+async function markExecuted(signalId: number | string, dir: Dir, signature: string) {
+  const id = dedupeKey(signalId, dir);
+  await db()
+    .collection("signal_events")
+    .doc(id)
+    .set(
+      {
+        status: "executed",
+        signature,
+        executedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+}
 
-    try {
-      if (isBuyOpen) {
-        const tokenAddress = outputMint;
-        const tokenSym = outputSymbol || tokenAddress;
+async function markFailed(signalId: number | string, dir: Dir, error: string) {
+  const id = dedupeKey(signalId, dir);
+  await db()
+    .collection("signal_events")
+    .doc(id)
+    .set(
+      {
+        status: "failed",
+        error,
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+}
 
-        if (USE_EXECUTOR) {
-          L.info(scope, "EXECUTE BUY", {
-            fromMint: inputMint,
-            toMint: outputMint,
-            amountSOL: inputAmount,
-            signalId: idKey,
-            slippageBps,
-          });
-          const { txSignature } = await execSwapAdapter(inputMint, tokenAddress, inputAmount, slippageBps);
-          execSig = txSignature;
-          L.info(scope, "BUY executed", { txSignature: execSig });
-        }
+/** =========================
+ *  Route
+ *  ========================= */
+router.post("/nexagent-signal", async (req: Request, res: Response) => {
+  const n = normalize(req.body as NexgentBody);
 
-        await db().collection("positions").doc(idKey).set(
-          {
-            status: "open",
-            source: "nexgent",
-            agentId,
-            txid: execSig || idKey,
-            tokenAddress,
-            tokenSymbol: tokenSym,
-            solSpent: inputAmount,
-            tokenReceived: outputAmount,
-            solPriceUsd: inputPriceUsd,
-            tokenPriceUsd: outputPriceUsd,
-            openedAt: timestamp,
-          },
-          { merge: true }
-        );
+  if (!n.ok) {
+    console.log("🟥 [nexagent-signal] Invalid payload:", n.reason, req.body);
+    return res.status(400).json({ ok: false, error: n.reason });
+  }
 
-        await db().collection("trades").add({
-          kind: "BUY",
-          source: "nexgent",
-          agentId,
-          txid: execSig || idKey,
-          tokenAddress,
-          tokenSymbol: tokenSym,
-          solAmount: inputAmount,
-          tokenAmount: outputAmount,
-          solPriceUsd: inputPriceUsd,
-          tokenPriceUsd: outputPriceUsd,
-          date: timestamp,
-          status: execSig ? "Success" : USE_EXECUTOR ? "Failed" : "Recorded",
-          signalId,
-        });
+  const {
+    dir,
+    tsISO,
+    signalId,
+    fromMint,
+    toMint,
+    amountSOL,
+    inputAmount,
+    outputAmount,
+    tokenSymbol,
+    slippageBps,
+  } = n;
 
-        L.info(scope, "BUY mirrored", {
-          signalId: idKey,
-          token: tokenSym,
-          solSpent: inputAmount,
-          tokenReceived: outputAmount,
-          executed: Boolean(execSig),
-        });
-      } else if (isSellClose) {
-        const tokenAddress = inputMint;
-        const tokenSym = inputSymbol || tokenAddress;
+  // Structured RX log
+  console.log("🟦 [nexagent-signal] RX", {
+    event: "agentTransactions",
+    ts: tsISO,
+    agentWallet: walletPubkey.toBase58(),
+    dir,
+    inputMint: fromMint,
+    inputAmount,
+    outputMint: toMint,
+    outputAmount,
+    amountSOL,
+    signalId,
+    slippageBps,
+  });
 
-        if (USE_EXECUTOR) {
-          L.info(scope, "EXECUTE SELL", {
-            fromMint: tokenAddress,
-            toMint: outputMint,
-            amountTokens: inputAmount,
-            signalId: idKey,
-            slippageBps,
-          });
-          const { txSignature } = await execSwapAdapter(tokenAddress, outputMint, inputAmount, slippageBps);
-          execSig = txSignature;
-          L.info(scope, "SELL executed", { txSignature: execSig });
-        }
+  // In-memory guard
+  const memKey = dedupeKey(signalId, dir);
+  if (seenInMemory.has(memKey)) {
+    console.log("🟨 [nexagent-signal] Duplicate (RAM) – skipping", { signalId, dir });
+    return res.json({ ok: true, duplicate: true, guard: "memory" });
+  }
 
-        // Close the position
-        let refToClose: FirebaseFirestore.DocumentReference | null = null;
-        const byKey = await db().collection("positions").doc(idKey).get();
-        if (byKey.exists) {
-          refToClose = byKey.ref;
-        } else {
-          const latestOpen = await db()
-            .collection("positions")
-            .where("tokenAddress", "==", tokenAddress)
-            .where("status", "==", "open")
-            .orderBy("openedAt", "desc")
-            .limit(1)
-            .get();
-          if (!latestOpen.empty) refToClose = latestOpen.docs[0].ref;
-        }
-
-        if (refToClose) {
-          await refToClose.update({
-            status: "closed",
-            closedAt: timestamp,
-            deactivationReason: "AgentTransaction",
-            tokenSold: inputAmount,
-            solReceived: outputAmount,
-            tokenPriceUsdAtClose: inputPriceUsd,
-            solPriceUsdAtClose: outputPriceUsd,
-            txid: execSig || idKey,
-          });
-        } else {
-          L.warn(scope, "No open position found to close; recording trade only", { tokenAddress });
-        }
-
-        await db().collection("trades").add({
-          kind: "SELL",
-          source: "nexgent",
-          agentId,
-          txid: execSig || idKey,
-          tokenAddress,
-          tokenSymbol: tokenSym,
-          tokenAmount: inputAmount,
-          solAmount: outputAmount,
-          tokenPriceUsd: inputPriceUsd,
-          solPriceUsd: outputPriceUsd,
-          date: timestamp,
-          status: execSig ? "Success" : USE_EXECUTOR ? "Failed" : "Recorded",
-          signalId,
-        });
-
-        L.info(scope, "SELL mirrored", {
-          signalId: idKey,
-          token: tokenSym,
-          tokenSold: inputAmount,
-          solReceived: outputAmount,
-          executed: Boolean(execSig),
-        });
-      }
-
-      await claimRef.set(
-        {
-          status: execSig ? "succeeded" : "failed_or_recorded",
-          finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-          txSignature: execSig || null,
-        },
-        { merge: true }
-      );
-
-      return res.status(200).json({ ok: true, tx: execSig || null });
-    } catch (execErr: any) {
-      await claimRef.set(
-        {
-          status: "failed",
-          finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-          error: String(execErr?.message || execErr),
-        },
-        { merge: true }
-      );
-      throw execErr;
+  try {
+    // DB guard
+    if (await isProcessed(signalId, dir)) {
+      console.log("🟨 [nexagent-signal] Duplicate (DB) – skipping", { signalId, dir });
+      seenInMemory.add(memKey);
+      return res.json({ ok: true, duplicate: true, guard: "db" });
     }
-  } catch (e: any) {
-    L.error("nexagent-signal", "Handler failed", e?.message || e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+
+    seenInMemory.add(memKey);
+    await markInProgress(signalId, dir, req.body);
+
+    /** =========================
+     *  EXECUTE
+     *  ========================= */
+    if (dir === "SELL" && !ENABLE_SELLS) {
+      // Mirror as "skipped" so your dashboard still shows intent,
+      // and positions can be reviewed manually if needed.
+      await logTradeToFirestore({
+        kind: "SELL",
+        status: "Skipped",
+        txid: "-",
+        tokenAddress: fromMint,
+        tokenSymbol,
+        solAmount: outputAmount || undefined, // SOL expected
+        tokenAmount: inputAmount || undefined, // tokens sold
+        date: new Date(tsISO),
+        note: "Sells disabled (ENABLE_SELLS != true)",
+      });
+      // Do NOT mark as executed; keep the event as "failed" so it could be retried later.
+      await markFailed(signalId, dir, "SELL disabled by config");
+      console.log("🟨 [nexagent-signal] SELL skipped (ENABLE_SELLS not true)", {
+        signalId,
+      });
+      return res.json({ ok: true, executed: false, skipped: "sells_disabled" });
+    }
+
+    console.log("🟦 [nexagent-signal] EXECUTE", {
+      dir,
+      fromMint,
+      toMint,
+      amountSOL,
+      slippageBps,
+      signalId: String(signalId),
+    });
+
+    // For now, executeSwap expects SOL input; BUYs are SOL→token, which is supported.
+    // When you enable SELLs, ensure tradeExecutor supports token→SOL swaps before flipping ENABLE_SELLS=true.
+    const signature = await executeSwap({
+      fromMint,
+      toMint,
+      amountSOL,
+      slippageBps,
+    });
+
+    console.log("🟦 [executor:send] Submitted", { sig: signature });
+
+    // One more confirmation probe for sanity
+    const tx = await connection.getTransaction(signature, { commitment: "confirmed" });
+    const executed = !!tx && !tx.meta?.err;
+
+    console.log(`🟦 [executor:confirm] ${executed ? "Confirmed" : "Unknown"}`, {
+      sig: signature,
+    });
+
+    /** =========================
+     *  MIRROR → Firestore
+     *  ========================= */
+    if (dir === "BUY") {
+      await logTradeToFirestore({
+        kind: "BUY",
+        status: executed ? "Success" : "Unknown",
+        txid: signature,
+        tokenAddress: toMint,
+        tokenSymbol,
+        solAmount: amountSOL,
+        tokenAmount: outputAmount || undefined,
+        date: new Date(tsISO),
+      });
+
+      await managePosition({
+        txid: signature,
+        status: "open",
+        tokenAddress: toMint,
+        tokenSymbol,
+        solSpent: amountSOL,
+        tokenReceived: outputAmount || undefined,
+        openedAt: new Date(tsISO),
+      });
+    } else {
+      // SELL
+      await logTradeToFirestore({
+        kind: "SELL",
+        status: executed ? "Success" : "Unknown",
+        txid: signature,
+        tokenAddress: fromMint,
+        tokenSymbol,
+        solAmount: amountSOL, // SOL received
+        tokenAmount: inputAmount || undefined, // tokens sold
+        date: new Date(tsISO),
+      });
+
+      // Try to close an open position for this token
+      try {
+        const open = await getOpenPositionByToken(fromMint);
+        if (open?.id) {
+          await closePosition(open.id, amountSOL, "sell_signal");
+        }
+      } catch (e) {
+        console.warn("⚠️ closePosition warning:", (e as any)?.message || e);
+      }
+    }
+
+    await markExecuted(signalId, dir, signature);
+    console.log(`🟦 [nexagent-signal] ${dir} executed`, { txSignature: signature });
+    return res.json({ ok: true, executed, signature });
+  } catch (err: any) {
+    const msg = String(err?.message || err);
+    await markFailed(signalId, dir, msg).catch(() => {});
+    console.error("🟥 [nexagent-signal] Handler failed", msg);
+    return res.status(500).json({ ok: false, error: msg });
   }
 });
 
