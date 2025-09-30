@@ -4,6 +4,7 @@ const { getMint } = require('@solana/spl-token');
 const dotenv = require('dotenv');
 const { logTradeToFirestore, managePosition } = require('./firebaseAdmin');
 const bs58 = require('bs58');
+const fetch = require('node-fetch'); // Required for our manual API call
 
 dotenv.config();
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -14,10 +15,8 @@ const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
 if (!rpcUrl) throw new Error("SOLANA_RPC_ENDPOINT is missing from the .env file.");
 const connection = new Connection(rpcUrl, 'confirmed');
 
-console.log("--- INITIALIZING JUPITER API CLIENT ---");
-console.log("--- CONFIGURING WITH V6 ENDPOINT: https://quote-api.jup.ag/v6 ---");
+// We still use the client for the 'swap' part, but not the 'quote'
 const jupiterApi = createJupiterApiClient({ basePath: "https://quote-api.jup.ag/v6" });
-
 
 async function getPriorityFee(): Promise<number> {
   const minFee = 25000; const maxFee = 1000000;
@@ -41,9 +40,7 @@ async function getTokenDecimals(mint: string): Promise<number> {
   return mintInfo.decimals;
 }
 
-// --- THIS IS THE FIX ---
-// Added the explicit "Promise<...>" return type to the function definition.
-async function handleTradeSignal(signal: { token_address: string; action: string; amount_input: number; }): Promise<{ signature: string; quote: any; }> {
+async function handleTradeSignal(signal: { token_address: string; action: string; amount_input: number; }) {
   const { token_address, action, amount_input } = signal;
   const slippageBps = 350; // 3.5%
   const isBuy = action.toUpperCase() === 'BUY';
@@ -52,13 +49,23 @@ async function handleTradeSignal(signal: { token_address: string; action: string
   const inputDecimals = await getTokenDecimals(inputMint);
   const amountInSmallestUnits = Math.round(amount_input * (10 ** inputDecimals));
   if (amountInSmallestUnits <= 0) throw new Error(`Invalid amount: ${amount_input}`);
-  console.log(`⚙️ [Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
   
-  const quote = await jupiterApi.quoteGet({
-    inputMint, outputMint, amount: amountInSmallestUnits, slippageBps, onlyDirectRoutes: false,
-  });
-  if (!quote) throw new Error('Failed to get quote.');
-  console.log('⚙️ [Executor] Got quote from Jupiter.');
+  console.log(`⚙️  [Executor] Starting ${action} trade for ${amount_input} of ${inputMint}`);
+
+  // --- MANUAL FETCH FOR QUOTE ---
+  console.log('⚙️  [Executor] Manually building and fetching quote from V6 API...');
+  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInSmallestUnits}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
+  
+  const quoteResponse = await fetch(quoteUrl);
+  if (!quoteResponse.ok) {
+    const errorBody = await quoteResponse.text();
+    throw new Error(`Failed to fetch quote: ${quoteResponse.status} ${quoteResponse.statusText} - ${errorBody}`);
+  }
+  const quote = await quoteResponse.json();
+  if (!quote) throw new Error('Failed to get a valid quote from Jupiter.');
+  // --- END MANUAL FETCH ---
+
+  console.log('⚙️  [Executor] Got quote from Jupiter.');
 
   const { swapTransaction, lastValidBlockHeight } = await jupiterApi.swapPost({
     swapRequest: {
@@ -66,12 +73,12 @@ async function handleTradeSignal(signal: { token_address: string; action: string
       wrapUnwrapSol: true, computeUnitPriceMicroLamports: await getPriorityFee(),
     },
   });
-  console.log('⚙️ [Executor] Received transaction from Jupiter.');
+  console.log('⚙️  [Executor] Received transaction from Jupiter.');
   
   const txBuffer = Buffer.from(swapTransaction, 'base64');
   let tx = VersionedTransaction.deserialize(txBuffer);
   tx.sign([walletKeypair]);
-  console.log('⚙️ [Executor] Transaction signed. Sending...');
+  console.log('⚙️  [Executor] Transaction signed. Sending...');
   
   const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
   await connection.confirmTransaction({
