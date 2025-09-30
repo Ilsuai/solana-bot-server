@@ -1,13 +1,12 @@
 // server/nexagent-signal.ts
 import express, { Router, Request, Response } from "express";
-import { Connection, PublicKey, ParsedAccountData } from "@solana/web3.js";
+import { Connection, PublicKey, ParsedAccountData, TokenAmount } from "@solana/web3.js";
 import { createHash } from "crypto";
 import admin from "./firebaseAdmin";
 import { executeSwap, toLamports, loadKeypairFromEnv } from "./tradeExecutor";
 
 const router = Router();
 
-// Accept JSON and raw text (some webhooks send wrong content-type)
 router.use(express.json({ limit: "2mb" }));
 router.use(express.text({ type: "*/*", limit: "2mb" }));
 
@@ -22,22 +21,23 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const MIRROR_ONLY = String(process.env.MIRROR_ONLY || "true") === "true";
 const DEFAULT_BUY_SOL = Number(process.env.DEFAULT_BUY_SOL || 0.1);
 
-// Mints
+// Optional per-trade caps (keep; useful safety)
+const MAX_SOL_PER_TRADE = Number(process.env.MAX_SOL_PER_TRADE || Number.POSITIVE_INFINITY);
+const MAX_TOKEN_UI_PER_TRADE = Number(process.env.MAX_TOKEN_UI_PER_TRADE || Number.POSITIVE_INFINITY);
+const FEE_RESERVE_SOL = Number(process.env.FEE_RESERVE_SOL || 0.02);
+
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Token registry (extend as needed)
 const TOKENS: Record<string, { symbol: string; decimals: number }> = {
   [SOL_MINT]: { symbol: "SOL", decimals: 9 },
   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: { symbol: "USDC", decimals: 6 },
 };
 
-// Pretty helpers (used in log lines)
 const toUi = (minor?: string, decimals?: number) =>
   !minor || decimals == null ? null : Number(minor) / 10 ** decimals;
 const fmt = (n: number | null | undefined, dp = 6) =>
   n == null || Number.isNaN(n) ? "?" : Number(n).toFixed(dp).replace(/\.?0+$/, "");
 
-// Shared
 const connection = new Connection(SOLANA_RPC_URL, {
   commitment: "confirmed",
   disableRetryOnRateLimit: false,
@@ -45,17 +45,14 @@ const connection = new Connection(SOLANA_RPC_URL, {
 const wallet = loadKeypairFromEnv();
 const db = admin.firestore();
 
-// ---------- Durable idempotency (supports reused signalId) ----------
+// ---------- Idempotency ----------
 function hashEventKey(parts: Record<string, any>) {
   const s = JSON.stringify(parts);
   return createHash("sha256").update(s).digest("hex").slice(0, 24);
 }
 async function reserveEvent(key: string) {
   const ref = db.collection("signal_events").doc(key);
-  await ref.create({
-    status: "PROCESSING",
-    ts: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  await ref.create({ status: "PROCESSING", ts: admin.firestore.FieldValue.serverTimestamp() });
 }
 async function completeEvent(
   key: string,
@@ -63,32 +60,40 @@ async function completeEvent(
   data: any
 ) {
   const ref = db.collection("signal_events").doc(key);
-  await ref.set(
-    { status, data, doneAt: admin.firestore.FieldValue.serverTimestamp() },
-    { merge: true }
-  );
+  await ref.set({ status, data, doneAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 }
 function logTrade(doc: Record<string, any>) {
-  return db.collection("trades").add({
-    ...doc,
-    ts: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  return db.collection("trades").add({ ...doc, ts: admin.firestore.FieldValue.serverTimestamp() });
 }
 
-// Decimals lookup (Token / Token-2022)
+// ---------- Decimals / balances ----------
 async function getMintDecimals(mint: string): Promise<number> {
   const pk = new PublicKey(mint);
   const parsed = await connection.getParsedAccountInfo(pk);
   const decParsed =
     (parsed.value?.data as ParsedAccountData | undefined)?.parsed?.info?.decimals;
   if (typeof decParsed === "number") return decParsed;
-
   const acc = await connection.getAccountInfo(pk);
   if (!acc || acc.data.length < 45) throw new Error("mint account not found");
   return acc.data[44];
 }
+async function getSolUiBalance(owner: PublicKey): Promise<number> {
+  const lamports = await connection.getBalance(owner, "confirmed");
+  return lamports / 1e9;
+}
+async function getTokenUiBalance(owner: PublicKey, mint: string): Promise<number> {
+  const mintPk = new PublicKey(mint);
+  const resp = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintPk }, "confirmed");
+  let total = 0;
+  for (const acc of resp.value) {
+    const info = (acc.account.data as ParsedAccountData).parsed?.info;
+    const amt: TokenAmount | undefined = info?.tokenAmount;
+    if (amt?.uiAmount != null) total += Number(amt.uiAmount);
+  }
+  return total;
+}
 
-// ---------- Parsing / normalization / validation ----------
+// ---------- Parsing / normalization ----------
 type AgentTx = {
   event?: string;
   ts?: string;
@@ -100,24 +105,20 @@ type AgentTx = {
   outputMint?: string;
   outputAmount?: number;
   amountSOL?: number;
-  signalId?: string; // allow string to match Nexgent ids
+  signalId?: string;
   slippageBps?: number;
-  raw?: any; // keep for debugging
+  raw?: any;
 };
 
 function parseBody(req: Request): any {
   if (typeof req.body === "object" && req.body !== null) return req.body;
   if (typeof req.body === "string" && req.body.trim()) {
-    try {
-      return JSON.parse(req.body);
-    } catch {
-      return { _raw: req.body };
-    }
+    try { return JSON.parse(req.body); } catch { return { _raw: req.body }; }
   }
   return {};
 }
 
-const isMint = (v: any) => typeof v === "string" && v.length >= 32 && v.length <= 64; // loose
+const isMint = (v: any) => typeof v === "string" && v.length >= 32 && v.length <= 64;
 const toSide = (v: any): "BUY" | "SELL" | undefined => {
   if (!v) return undefined;
   const s = String(v).toLowerCase();
@@ -126,18 +127,17 @@ const toSide = (v: any): "BUY" | "SELL" | undefined => {
   return undefined;
 };
 
-// Try to map many possible field names; supports nested `data.*`
+// IMPORTANT: no longer read `transaction_amount` — it’s not guaranteed to be SOL-in.
 function normalize(raw: any): AgentTx {
   const b = raw || {};
   const d = b.data || b.payload || b.eventData || {};
+  const s = d.swap || d.swap_data || d.transaction || d.txn || d.trade || d.details || {};
 
-  // 1) basic identity/time
   const event = b.event || b.type || d.event || "agentTransactions";
   const ts = b.ts || b.timestamp || d.ts || d.timestamp || new Date().toISOString();
   const agentId = b.agentId ?? d.agentId ?? d.agent_id ?? null;
   const agentWallet = b.agentWallet ?? b.wallet ?? d.wallet ?? d.payer ?? d.owner ?? null;
 
-  // 2) direction (more aliases + transaction_* names)
   const dir =
     toSide(b.dir) ||
     toSide(b.direction) ||
@@ -148,9 +148,6 @@ function normalize(raw: any): AgentTx {
     toSide(d.trade_action) ||
     toSide(d.transaction_side) ||
     toSide(d.transaction_direction);
-
-  // 3) mints (Nexgent often nests under swap/swap_data/transaction)
-  const s = d.swap || d.swap_data || d.transaction || d.txn || d.trade || d.details || {};
 
   const inputMint =
     b.inputMint ||
@@ -176,7 +173,7 @@ function normalize(raw: any): AgentTx {
     s.to_token_mint ||
     s.quote_mint;
 
-  // 4) amounts (UI) — include Nexgent's `transaction_amount`
+  // ONLY real execution amounts
   const inputAmount =
     b.inputAmount ??
     d.inputAmount ??
@@ -184,11 +181,7 @@ function normalize(raw: any): AgentTx {
     d.amount_in ??
     s.amount_in ??
     s.input_amount ??
-    s.ui_amount_in ??
-    d.uiAmount ??
-    d.amount ??
-    d.transaction_amount ??
-    s.transaction_amount;
+    s.ui_amount_in;
 
   const outputAmount =
     b.outputAmount ??
@@ -202,7 +195,6 @@ function normalize(raw: any): AgentTx {
   const amountSOL =
     b.amountSOL ?? d.amountSOL ?? d.sol_in ?? d.solAmount ?? s.sol_in ?? s.sol_amount;
 
-  // 5) id / slippage
   const signalId =
     (b.signalId ??
       d.signalId ??
@@ -253,18 +245,18 @@ function validateRequired(p: AgentTx): { ok: true } | { ok: false; error: string
   if (!p.dir) missing.push("dir");
   if (!isMint(p.inputMint)) missing.push("inputMint");
   if (!isMint(p.outputMint)) missing.push("outputMint");
-  if (!Number.isFinite(p.inputAmount ?? NaN) && !Number.isFinite(p.amountSOL ?? NaN)) {
+  // require real executable size
+  if (!Number.isFinite(p.amountSOL ?? NaN) && !Number.isFinite(p.inputAmount ?? NaN)) {
     missing.push("inputAmount/amountSOL");
   }
   if (!p.signalId) missing.push("signalId");
-
   if (missing.length) {
     return {
       ok: false,
       error:
         "Missing required fields: " +
         missing.join(", ") +
-        ". Ensure JSON includes dir, inputMint, outputMint, inputAmount (or amountSOL), and signalId.",
+        ". Need dir, mints, and a real amount (amountSOL or inputAmount).",
     };
   }
   return { ok: true };
@@ -274,7 +266,6 @@ function validateRequired(p: AgentTx): { ok: true } | { ok: false; error: string
 router.post("/nexagent-signal", async (req: Request, res: Response) => {
   console.log("➡️  POST /nexagent-signal");
 
-  // Optional shared-secret auth
   if (WEBHOOK_SECRET) {
     const hdr = req.get("x-webhook-secret");
     if (hdr !== WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: "unauthorized" });
@@ -283,19 +274,13 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   const raw = parseBody(req);
   let body = normalize(raw);
 
-  // --- Heuristics to fill missing fields ---
+  // Fill from mints if direction missing
   let finalBody: AgentTx = { ...body };
-
-  // If dir missing, infer from mints
   if (!finalBody.dir && finalBody.inputMint && finalBody.outputMint) {
-    if (finalBody.inputMint === SOL_MINT && finalBody.outputMint !== SOL_MINT) {
-      finalBody.dir = "BUY";
-    } else if (finalBody.outputMint === SOL_MINT && finalBody.inputMint !== SOL_MINT) {
-      finalBody.dir = "SELL";
-    }
+    if (finalBody.inputMint === SOL_MINT && finalBody.outputMint !== SOL_MINT) finalBody.dir = "BUY";
+    else if (finalBody.outputMint === SOL_MINT && finalBody.inputMint !== SOL_MINT) finalBody.dir = "SELL";
   }
-
-  // If it's a BUY-from-SOL and amountSOL missing but inputAmount present, copy it
+  // BUY from SOL: mirror amountSOL from inputAmount if present
   if (
     finalBody.dir === "BUY" &&
     finalBody.inputMint === SOL_MINT &&
@@ -305,14 +290,10 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     finalBody.amountSOL = Number(finalBody.inputAmount);
   }
 
-  // --- Optional strategy mode: convert "tradeSignals" into a BUY of DEFAULT_BUY_SOL ---
+  // Optional tradeSignals => synthetic BUY of DEFAULT_BUY_SOL (disabled when MIRROR_ONLY=true)
   if (!MIRROR_ONLY && (finalBody.event === "tradeSignals" || raw?.event === "tradeSignals")) {
     const tokenAddr =
-      raw?.data?.token_address ||
-      raw?.data?.tokenAddress ||
-      body?.raw?.data?.token_address ||
-      body?.raw?.data?.tokenAddress;
-
+      raw?.data?.token_address || raw?.data?.tokenAddress || body?.raw?.data?.token_address || body?.raw?.data?.tokenAddress;
     if (typeof tokenAddr === "string" && tokenAddr.length >= 32) {
       finalBody.dir = "BUY";
       finalBody.inputMint = SOL_MINT;
@@ -320,25 +301,12 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
       finalBody.amountSOL = DEFAULT_BUY_SOL;
       finalBody.inputAmount = DEFAULT_BUY_SOL;
       finalBody.signalId = String(
-        finalBody.signalId ??
-          raw?.data?.id ??
-          raw?.data?.signal_id ??
-          raw?.data?.tradeId ??
-          raw?.data?.created_at ??
-          Date.now()
+        finalBody.signalId ?? raw?.data?.id ?? raw?.data?.signal_id ?? raw?.data?.tradeId ?? raw?.data?.created_at ?? Date.now()
       );
-      console.warn("[nexagent-signal] tradeSignals -> SYNTH BUY", {
-        token: tokenAddr,
-        amountSOL: DEFAULT_BUY_SOL,
-        signalId: finalBody.signalId,
-      });
+      console.warn("[nexagent-signal] tradeSignals -> SYNTH BUY", { token: tokenAddr, amountSOL: DEFAULT_BUY_SOL, signalId: finalBody.signalId });
     } else {
       console.warn("[nexagent-signal] tradeSignals ignored (no token_address)");
-      return res.status(200).json({
-        ok: true,
-        ignored: true,
-        reason: "tradeSignals without token_address",
-      });
+      return res.status(200).json({ ok: true, ignored: true, reason: "tradeSignals without token_address" });
     }
   }
 
@@ -351,28 +319,19 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     signalId: finalBody.signalId,
   });
 
-  // If this is obviously a "signal" (analytics) without swap details, just ignore politely.
-  const txnType =
-    raw?.transaction_type || raw?.data?.transaction_type || raw?.data?.type || finalBody.event;
-  if (
-    (!finalBody.dir || !finalBody.inputMint || !finalBody.outputMint) &&
-    (txnType === "swap" || finalBody.event === "tradeSignals" || finalBody.event === "agentTransactions")
-  ) {
-    const preview =
-      typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
-    console.warn("[nexagent-signal] Ignored (no actionable swap fields)", { preview });
-    return res.status(200).json({
-      ok: true,
-      ignored: true,
-      reason: "no actionable swap fields (waiting for detailed payload)",
-    });
+  // If we still don't have an executable amount, ignore politely
+  const hasExecutableAmount =
+    Number.isFinite(finalBody.amountSOL as any) ||
+    Number.isFinite(finalBody.inputAmount as any);
+  if (!hasExecutableAmount) {
+    const preview = typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
+    console.warn("[nexagent-signal] Ignored (no executable amount)", { preview });
+    return res.status(200).json({ ok: true, ignored: true, reason: "no executable amount" });
   }
 
-  // Validate BEFORE idempotency/DB
   const valid = validateRequired(finalBody);
   if (!valid.ok) {
-    const preview =
-      typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
+    const preview = typeof raw === "string" ? raw.slice(0, 240) : JSON.stringify(raw).slice(0, 240);
     console.warn("[nexagent-signal] Bad payload", { error: valid.error, preview });
     return res.status(200).json({ ok: true, ignored: true, reason: valid.error });
   }
@@ -383,31 +342,50 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
   const signalId = String(finalBody.signalId);
   const slippageBps = finalBody.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
 
-  // Min amount guards (avoid Jupiter 400s)
+  // ---- Balance-aware sizing (same as before) ----
+  let desiredUi = 0;
+
   if (dir === "BUY" && inputMint === SOL_MINT) {
-    const ui = Number(finalBody.amountSOL ?? finalBody.inputAmount ?? 0);
-    if (!Number.isFinite(ui) || ui < 0.01)
-      return res.status(200).json({ ok: true, ignored: true, reason: "BUY too small (<0.01 SOL)" });
-  }
-  if (dir === "SELL") {
-    const ui = Number(finalBody.inputAmount ?? 0);
-    if (!Number.isFinite(ui) || ui < 0.1)
-      return res.status(200).json({ ok: true, ignored: true, reason: "SELL too small (<0.10)" });
+    desiredUi = Number(finalBody.amountSOL ?? finalBody.inputAmount ?? 0);
+    if (Number.isFinite(MAX_SOL_PER_TRADE)) desiredUi = Math.min(desiredUi, MAX_SOL_PER_TRADE);
+
+    const solBal = await getSolUiBalance(wallet.publicKey);
+    const maxSpendable = Math.max(0, solBal - FEE_RESERVE_SOL);
+    if (desiredUi > maxSpendable) {
+      console.warn("[nexagent-signal] BUY clipped by SOL balance", { requested: desiredUi, balance: solBal, reserve: FEE_RESERVE_SOL, maxSpendable });
+      desiredUi = maxSpendable;
+    }
+    if (desiredUi < 0.01) {
+      await completeEvent(hashEventKey({ signalId, dir, inputMint, outputMint }), "SKIPPED", { reason: "BUY too small after balance/cap" });
+      return res.status(200).json({ ok: true, ignored: true, reason: "BUY too small after balance/cap" });
+    }
+    finalBody.amountSOL = desiredUi;
+    finalBody.inputAmount = desiredUi;
   }
 
-  // ---- Idempotency key (allows same signalId multiple times) ----
+  if (dir === "SELL") {
+    desiredUi = Number(finalBody.inputAmount ?? 0);
+    if (Number.isFinite(MAX_TOKEN_UI_PER_TRADE)) desiredUi = Math.min(desiredUi, MAX_TOKEN_UI_PER_TRADE);
+
+    const bal = await getTokenUiBalance(wallet.publicKey, inputMint);
+    if (desiredUi > bal) {
+      console.warn("[nexagent-signal] SELL clipped by token balance", { requested: desiredUi, balance: bal });
+      desiredUi = bal;
+    }
+    if (desiredUi < 0.1) {
+      await completeEvent(hashEventKey({ signalId, dir, inputMint, outputMint }), "SKIPPED", { reason: "SELL too small after balance/cap" });
+      return res.status(200).json({ ok: true, ignored: true, reason: "SELL too small after balance/cap" });
+    }
+    finalBody.inputAmount = desiredUi;
+  }
+
+  // Idempotency key uses the (possibly clipped) amount
   const roundedUiAmount =
     inputMint === SOL_MINT
       ? Number((Number(finalBody.amountSOL ?? finalBody.inputAmount) || 0).toFixed(9))
       : Number((Number(finalBody.inputAmount) || 0).toFixed(9));
 
-  const eventKey = hashEventKey({
-    signalId,
-    dir,
-    inputMint,
-    outputMint,
-    amountUi: roundedUiAmount,
-  });
+  const eventKey = hashEventKey({ signalId, dir, inputMint, outputMint, amountUi: roundedUiAmount });
 
   try {
     await reserveEvent(eventKey);
@@ -415,33 +393,20 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     const code = e?.code || e?.status || e?.errorInfo?.code;
     const msg = String(e?.message || "");
     if (code === 6 || code === "already-exists" || msg.toUpperCase().includes("ALREADY_EXISTS")) {
-      console.warn("[nexagent-signal] Duplicate (DB) – skipping", {
-        signalId,
-        dir,
-        key: eventKey,
-      });
+      console.warn("[nexagent-signal] Duplicate (DB) – skipping", { signalId, dir, key: eventKey });
       return res.status(200).json({ ok: true, duplicate: true });
     }
     console.error("[nexagent-signal] reserveEvent failed", msg);
     return res.status(500).json({ ok: false, error: msg });
   }
 
-  // SELL global switch
   if (dir === "SELL" && !ENABLE_SELLS) {
-    await logTrade({
-      action: "SELL_SKIPPED",
-      txid: "-",
-      reason: "ENABLE_SELLS=false",
-      signalId,
-      mintIn: inputMint,
-      mintOut: outputMint,
-    });
+    await logTrade({ action: "SELL_SKIPPED", txid: "-", reason: "ENABLE_SELLS=false", signalId, mintIn: inputMint, mintOut: outputMint });
     await completeEvent(eventKey, "SKIPPED", { reason: "SELL_DISABLED" });
     return res.json({ ok: true, skipped: true });
   }
 
   try {
-    // compute input amount in minor units
     let amountMinor: string;
     let inUiAmount = 0;
 
@@ -449,8 +414,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
       inUiAmount = Number(finalBody.amountSOL ?? finalBody.inputAmount ?? 0);
       amountMinor = toLamports(inUiAmount);
     } else {
-      const decimals =
-        TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
+      const decimals = TOKENS[inputMint]?.decimals ?? (await getMintDecimals(inputMint));
       inUiAmount = Number(finalBody.inputAmount ?? 0);
       amountMinor = BigInt(Math.round(inUiAmount * 10 ** decimals)).toString();
     }
@@ -468,9 +432,7 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     const inSym = TOKENS[inputMint]?.symbol ?? `${inputMint.slice(0, 4)}…`;
     const outSym = TOKENS[outputMint]?.symbol ?? `${outputMint.slice(0, 4)}…`;
     const outUi = toUi(exec.outAmount, TOKENS[outputMint]?.decimals);
-    const impactPct = exec.priceImpactPct
-      ? (Number(exec.priceImpactPct) * 100).toFixed(2) + "%"
-      : "n/a";
+    const impactPct = exec.priceImpactPct ? (Number(exec.priceImpactPct) * 100).toFixed(2) + "%" : "n/a";
 
     await logTrade({
       action: dir,
@@ -506,7 +468,6 @@ router.post("/nexagent-signal", async (req: Request, res: Response) => {
     const msg = String(e?.message || e);
     const logs = e?.logs || e?.value?.logs;
     if (logs) console.error("[sendTx logs]\n" + logs.join("\n"));
-
     await completeEvent(eventKey, "FAILED", { error: msg });
     console.error("[nexagent-signal] Handler failed", msg);
     return res.status(500).json({ ok: false, error: msg });
