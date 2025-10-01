@@ -121,21 +121,16 @@ async function performSwap(
         }
     }
 
-    // --- FIX IS HERE ---
-    // Use `instruction.accounts` which is the correct property from Jupiter's API response.
     const rehydrateInstruction = (instruction: any) => {
       if (!instruction) return null;
       return new TransactionInstruction({
         programId: new PublicKey(instruction.programId),
         keys: (instruction.accounts || []).map((key: any) => ({
-          pubkey: new PublicKey(key.pubkey),
-          isSigner: key.isSigner,
-          isWritable: key.isWritable,
+          pubkey: new PublicKey(key.pubkey), isSigner: key.isSigner, isWritable: key.isWritable,
         })),
         data: Buffer.from(instruction.data, 'base64'),
       });
     };
-    // --- END OF FIX ---
     
     const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
     const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
@@ -148,53 +143,22 @@ async function performSwap(
         lamports: tipAmountSOL * LAMPORTS_PER_SOL,
     });
 
-    const instructionsForFeeAndCU = [
+    const instructionsWithoutFees = [
         ...setupInstructions, swapInstruction,
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         tipInstruction,
     ].filter((ix): ix is TransactionInstruction => !!ix);
 
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    const priorityFee = await getPriorityFee(instructionsForFeeAndCU, addressLookupTableAccounts);
-    
-    const testInstructionsForCU = [
+    const priorityFee = await getPriorityFee(instructionsWithoutFees, addressLookupTableAccounts);
+
+    console.log(`[Compute Units] Bypassing simulation. Using fixed limit: 1,400,000`);
+    const finalInstructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
-    ];
-    const testMessage = new TransactionMessage({
-        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
-    }).compileToV0Message(addressLookupTableAccounts);
-    
-    const accountsFromLookups: PublicKey[] = [];
-    addressLookupTableAccounts.forEach(table => {
-        accountsFromLookups.push(...table.state.addresses);
-    });
-
-    const simResult = await connection.simulateTransaction(
-        new VersionedTransaction(testMessage), 
-        { 
-            sigVerify: false,
-            replaceRecentBlockhash: true,
-            accounts: {
-                encoding: "base64",
-                addresses: accountsFromLookups.map(key => key.toBuffer().toString("base64")),
-            },
-        }
-    );
-
-    if (simResult.value.err || !simResult.value.unitsConsumed) {
-        throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
-    }
-    const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
-    console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
-
-    const finalInstructions = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
+        ...instructionsWithoutFees,
     ];
 
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     const messageV0 = new TransactionMessage({
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: finalInstructions,
     }).compileToV0Message(addressLookupTableAccounts);
@@ -226,7 +190,10 @@ async function performSwap(
     
     const txid = json.result;
     const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
-    if (confirmation.value.err) throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+    if (confirmation.value.err) {
+        console.error('[Confirmation Error]', confirmation.value.err);
+        throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
 
     console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
     return { txid, quote };
@@ -235,7 +202,7 @@ async function performSwap(
 export async function executeTrade(
   tokenAddress: string, action: 'BUY' | 'SELL', solAmount: number, signalId: number
 ): Promise<void> {
-    const slippageSettings = [500, 1500, 2500];
+    const slippageSettings = [500, 1500, 2500]; // 5%, 15%, 25%
     for (let i = 0; i < slippageSettings.length; i++) {
         const currentSlippage = slippageSettings[i];
         try {
@@ -276,6 +243,33 @@ export async function executeTrade(
             return;
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
+
+            if (i === slippageSettings.length - 1 && action === 'SELL') {
+                try {
+                    console.warn(`[PANIC SELL] Standard attempts failed. Trying one last time with 90% slippage...`);
+                    const position = await getOpenPositionBySignalId(signalId);
+                    if (!position) { throw new Error("Could not find position to panic sell."); }
+
+                    const tokenDecimals = await getTokenDecimals(position.tokenAddress);
+                    const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
+                    
+                    const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, 9000); // 9000 BPS = 90%
+                    
+                    const solReceived = Number(quote.outAmount) / 10 ** 9;
+                    console.log(`📝 Logging PANIC SELL trade to database...`);
+                    await logTradeToFirestore({ txid, status: 'Success (Panic)', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: 9000, date: new Date(), signal_id: signalId });
+                    await closePosition(String(signalId), txid, solReceived);
+                    console.log(`🎉 Successfully panic-sold and closed position for Signal ID: ${signalId}`);
+                    console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                    return;
+                } catch (panicError: any) {
+                    console.error(`🛑 [FATAL] PANIC SELL FAILED:`, panicError.message);
+                    await logTradeToFirestore({ txid: null, status: 'Failed (Panic)', kind: action, solAmount: 0, tokenAddress: tokenAddress, reason: panicError.message || 'Unknown panic error', date: new Date(), signal_id: signalId });
+                    console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                    throw panicError;
+                }
+            }
+
             if (i === slippageSettings.length - 1) {
                 console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
                 await logTradeToFirestore({ txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0, tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId });
