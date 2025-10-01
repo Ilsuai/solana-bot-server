@@ -21,16 +21,18 @@ import fetch from 'node-fetch';
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
 // --- FIX IS HERE ---
-// Updated list of official Helius tip accounts from the error log.
+// Using the EXACT list of wallets from the most recent error log.
 const JITO_TIP_ACCOUNTS = [
-  "96gYgAKpdZvy5M2sZpSoe6W6h4scqw4v9v7K6h4xW6h4",
-  "5z6r3bWKgJ8b3bWKgJ8b3bWKgJ8b3bWKgJ8b3bWKgJ8b",
-  "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo",
-  "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-  "ADaUMid9yfUvjgqa3zbYxPFJ2g5vVbvoUvCefeCathEe",
-  "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwVyaL",
-  "DttWaKGXQ2sApveDb6V8rg8k5RREJxM6ENv67Z4tLke6",
-  "GvDsBf7p2PPdD66n1Gsw2sC2EMwG8i9eJd2YjFesv6Qq",
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+  "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+  "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+  "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
 ].map(a => new PublicKey(a));
 // --- END OF FIX ---
 
@@ -106,10 +108,7 @@ async function performSwap(
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         SystemProgram.transfer({
             fromPubkey: walletKeypair.publicKey,
-            // --- FIX IS HERE ---
-            // Pick a random tip account from the valid list
             toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
-            // --- END OF FIX ---
             lamports: 1_000_000,
         }),
     ].filter((ix): ix is TransactionInstruction => !!ix);
