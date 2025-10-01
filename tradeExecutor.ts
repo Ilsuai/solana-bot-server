@@ -3,6 +3,11 @@ import {
   Keypair,
   VersionedTransaction,
   PublicKey,
+  TransactionMessage,
+  AddressLookupTableAccount,
+  ComputeBudgetProgram,
+  SystemProgram,
+  TransactionInstruction,
 } from '@solana/web3.js';
 import {
   createJupiterApiClient,
@@ -11,8 +16,11 @@ import {
 import { getMint } from '@solana/spl-token';
 import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
+import fetch from 'node-fetch'; // We need this for the Helius Sender API
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
+// A stable, official Jito tip account from the Helius documentation.
+const JITO_TIP_ACCOUNT = new PublicKey("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo");
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
   throw new Error('Missing environment variables.');
@@ -37,66 +45,104 @@ async function performSwap(
   inputMint: string,
   outputMint: string,
   amount: number,
-  slippageBps: number,
-  isPanicSell: boolean = false
+  slippageBps: number
 ): Promise<{ txid: string; quote: QuoteResponse }> {
-  console.log(`[Swap] Getting quote from Jupiter...`);
+    console.log(`[Swap] Getting quote from Jupiter...`);
+    const quote = await jupiterApi.quoteGet({
+        inputMint, outputMint, amount, slippageBps,
+        asLegacyTransaction: false,
+    });
+    if (!quote) throw new Error('Failed to get a quote from Jupiter.');
 
-  const quote = await jupiterApi.quoteGet({
-    inputMint,
-    outputMint,
-    amount,
-    slippageBps,
+    console.log(`[Swap] Building transaction for Helius Sender...`);
+
     // @ts-ignore
-    // Use dynamic fees to automatically find the best fee for the network.
-    priorityFeeLevel: isPanicSell ? 'TURBO' : 'VERY_HIGH',
-    asLegacyTransaction: false,
-  });
+    const { computeBudgetInstructions, setupInstructions, swapInstruction, cleanupInstruction, addressLookupTableAccounts: addressLookupTableKeys } = 
+      await jupiterApi.swapInstructionsPost({
+        swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
+    });
 
-  if (!quote) {
-    throw new Error('Failed to get a quote from Jupiter.');
-  }
+    const instructions = [
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }), // High priority fee
+        ...(computeBudgetInstructions || []),
+        ...(setupInstructions || []),
+        swapInstruction,
+        ...(cleanupInstruction ? [cleanupInstruction] : []),
+        SystemProgram.transfer({
+            fromPubkey: walletKeypair.publicKey,
+            toPubkey: JITO_TIP_ACCOUNT,
+            lamports: 1_000_000, // 0.001 SOL Jito Tip
+        }),
+    ].filter((ix): ix is TransactionInstruction => !!ix);
+    
+    const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
+    if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
+        const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
+            addressLookupTableKeys.map((key: string) => new PublicKey(key))
+        );
+        for (let i = 0; i < lookupTableAccountInfos.length; i++) {
+            if (lookupTableAccountInfos[i]) {
+                addressLookupTableAccounts.push(new AddressLookupTableAccount({
+                    key: new PublicKey(addressLookupTableKeys[i]),
+                    state: AddressLookupTableAccount.deserialize(lookupTableAccountInfos[i]!.data),
+                }));
+            }
+        }
+    }
+    
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+        payerKey: walletKeypair.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+    }).compileToV0Message(addressLookupTableAccounts);
+    
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([walletKeypair]);
+    const rawTransaction = Buffer.from(transaction.serialize()).toString('base64');
 
-  // Let Jupiter build the full transaction, which we know works.
-  const swapResult = await jupiterApi.swapPost({
-    swapRequest: {
-      quoteResponse: quote,
-      userPublicKey: walletKeypair.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-    },
-  });
+    // --- FIX STARTS HERE ---
 
-  const swapTransactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
-  const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-  transaction.sign([walletKeypair]);
+    // 1. Dynamically get API key from your RPC endpoint variable
+    const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
+    if (!apiKey) {
+      throw new Error("Could not extract API key from SOLANA_RPC_ENDPOINT");
+    }
+    const senderUrl = `https://sender.helius-rpc.com/?api-key=${apiKey}`;
 
-  const rawTransaction = transaction.serialize();
-  
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  
-  const txid = await connection.sendRawTransaction(rawTransaction, {
-    skipPreflight: true,
-    maxRetries: 5,
-  });
+    console.log(`[Swap] Sending transaction via Helius Sender...`);
+    const response = await fetch(senderUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: '1',
+            method: 'sendTransaction',
+            // 2. Add the required configuration object to the params array
+            params: [
+              rawTransaction,
+              {
+                encoding: "base64",
+                skipPreflight: true,
+                maxRetries: 0
+              }
+            ],
+        }),
+    });
+    
+    // --- FIX ENDS HERE ---
 
-  const confirmation = await connection.confirmTransaction(
-    { 
-      signature: txid, 
-      blockhash: blockhash,
-      lastValidBlockHeight: lastValidBlockHeight
-    },
-    'confirmed'
-  );
+    const json = await response.json() as { result: string, error?: any };
+    if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
+    
+    const txid = json.result;
+    const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
+    if (confirmation.value.err) throw new Error(`Transaction confirmation failed.`);
 
-  if (confirmation.value.err) {
-    throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
-  }
-  
-  console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
-  return { txid, quote };
+    console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
+    return { txid, quote };
 }
 
-// The 'executeTrade' function remains unchanged.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
@@ -114,11 +160,12 @@ export async function executeTrade(
                 const amountInLamports = Math.round(solAmount * 10 ** 9);
                 const { txid, quote } = await performSwap(SOL_MINT_ADDRESS, tokenAddress, amountInLamports, currentSlippage);
                 const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
+                
                 console.log(`📝 Logging BUY trade to database...`);
                 await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount, tokenAmount: tokenAmountReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
                 await managePosition({ signal_id: signalId, status: 'open', tokenAddress, solSpent: solAmount, tokenReceived: tokenAmountReceived, openedAt: new Date() });
                 console.log(`🎉 Successfully opened position for Signal ID: ${signalId}`);
-            } else {
+            } else { // Handle SELL action
                 console.log(`🔍 Checking for open position for Signal ID: ${signalId}...`);
                 const position = await getOpenPositionBySignalId(signalId);
                 if (!position) {
@@ -128,10 +175,12 @@ export async function executeTrade(
                 }
                 console.log(`✅ Position found. Preparing to sell ${position.tokenReceived.toFixed(2)} tokens.`);
                 console.log(`💰 Executing SELL with ${currentSlippage / 100}% slippage.`);
+
                 const tokenDecimals = await getTokenDecimals(position.tokenAddress);
                 const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
                 const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, currentSlippage);
                 const solReceived = Number(quote.outAmount) / 10 ** 9;
+                
                 console.log(`📝 Logging SELL trade to database...`);
                 await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
                 await closePosition(String(signalId), txid, solReceived);
@@ -142,24 +191,7 @@ export async function executeTrade(
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
             if (i === slippageSettings.length - 1) {
-                 if (action === 'SELL') {
-                    console.log(`\n--- [FINAL ATTEMPT - PANIC SELL] ---`);
-                    try {
-                        const position = await getOpenPositionBySignalId(signalId);
-                        if (!position) throw new Error("Position not found for panic sell.");
-                        const tokenDecimals = await getTokenDecimals(position.tokenAddress);
-                        const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
-                        const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, 9000, true);
-                        const solReceived = Number(quote.outAmount) / 10 ** 9;
-                        await logTradeToFirestore({ txid, status: 'Success (Panic)', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: 9000, date: new Date(), signal_id: signalId });
-                        await closePosition(String(signalId), txid, solReceived);
-                        console.log(`🎉 Successfully PANIC SOLD and closed position for Signal ID: ${signalId}`);
-                        console.log(`================== [SIGNAL ${signalId} END] ======================`);
-                        return;
-                    } catch (panicError: any) {
-                        console.error(`🛑 [FATAL] PANIC SELL FAILED for Signal ID ${signalId}:`, panicError.message);
-                    }
-                }
+                 // Panic Sell Logic can be re-added here if needed
                 console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
                 await logTradeToFirestore({ txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0, tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId });
                 console.log(`================== [SIGNAL ${signalId} END] ======================`);
