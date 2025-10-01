@@ -206,22 +206,31 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     let finalTransaction = new VersionedTransaction(finalMessage);
     finalTransaction.sign([walletKeypair]);
     
-    const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
-    const senderUrl = `http://ewr-sender.helius-rpc.com/fast?api-key=${apiKey}`;
-    
-    console.log(`[Helius] Sending transaction...`);
-    const response = await fetch(senderUrl, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            jsonrpc: '2.0', id: '1', method: 'sendTransaction',
-            params: [ Buffer.from(finalTransaction.serialize()).toString('base64'), { encoding: "base64", skipPreflight: true } ],
-        }),
-    });
-    const json = await response.json() as any;
-    if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
-    const txid = json.result;
-    if (!txid) throw new Error('Helius Sender did not return a transaction signature.');
-    console.log(`[Helius] Transaction sent successfully. Signature: ${txid}`);
+    let txid: string;
+    try {
+      console.log('[Send] Attempting with Helius Sender...');
+      const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
+      const senderUrl = `https://sender.helius-rpc.com/fast?api-key=${apiKey}`;
+      
+      const response = await fetch(senderUrl, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+              jsonrpc: '2.0', id: '1', method: 'sendTransaction',
+              params: [
+                  bs58.encode(finalTransaction.serialize()), 
+                  { encoding: "base58", skipPreflight: true, maxRetries: 0 } 
+              ],
+          }),
+      });
+      const json = await response.json() as any;
+      if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
+      if (!json.result) throw new Error('Helius Sender did not return a signature.');
+      txid = json.result;
+      console.log(`[Helius] Transaction sent successfully. Signature: ${txid}`);
+    } catch (e) {
+      console.warn('[Send] Helius Sender failed, falling back to standard RPC:', (e as Error).message);
+      txid = await connection.sendRawTransaction(finalTransaction.serialize(), { skipPreflight: true, maxRetries: 2 });
+    }
     
     console.log(`[Confirm] Waiting for transaction confirmation...`);
     const confResult = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');

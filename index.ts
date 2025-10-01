@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { executeTradeFromSignal, TradeSignal } from './tradeExecutor'; // Import new function and type
+import { executeTradeFromSignal, TradeSignal } from './tradeExecutor';
 import { initializeFirebase } from './firebaseAdmin';
 import fetch from 'node-fetch';
 
@@ -81,25 +81,22 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log(`✅ Server is running and listening on port ${port}`);
 
-    const apiKey = process.env.SOLANA_RPC_ENDPOINT?.split('api-key=')[1];
-    if (apiKey) {
-        const senderPingUrl = `http://ewr-sender.helius-rpc.com/ping?api-key=${apiKey}`;
-        const warmConnection = async () => {
-            try {
-                // @ts-ignore
-                const response = await fetch(senderPingUrl);
-                if (response.ok) {
-                    console.log(`[Warmup] Ping successful. Connection is warm.`);
-                } else {
-                    console.warn(`[Warmup] Ping failed with status: ${response.status}`);
-                }
-            } catch (error) {
-                console.error('[Warmup] Ping failed with error:', (error as Error).message);
+    // Use the global HTTPS endpoint for the warmup ping
+    const senderPingUrl = `https://sender.helius-rpc.com/ping`;
+    const warmConnection = async () => {
+        try {
+            // @ts-ignore
+            const response = await fetch(senderPingUrl);
+            if (response.ok) {
+                console.log(`[Warmup] Ping successful to global sender. Connection is warm.`);
+            } else {
+                console.warn(`[Warmup] Ping failed with status: ${response.status}`);
             }
-        };
-        warmConnection();
-        setInterval(warmConnection, 50000);
-    } else {
-        console.warn('[Warmup] Could not start connection warmer: API key not found.');
-    }
+        } catch (error) {
+            console.error('[Warmup] Ping failed with error:', (error as Error).message);
+        }
+    };
+
+    warmConnection();
+    setInterval(warmConnection, 50000);
 });
