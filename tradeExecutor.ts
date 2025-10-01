@@ -3,11 +3,6 @@ import {
   Keypair,
   VersionedTransaction,
   PublicKey,
-  TransactionMessage,
-  AddressLookupTableAccount,
-  ComputeBudgetProgram,
-  SystemProgram,
-  TransactionInstruction,
 } from '@solana/web3.js';
 import {
   createJupiterApiClient,
@@ -18,7 +13,6 @@ import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePo
 import bs58 from 'bs58';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
-const JITO_TIP_ACCOUNT = new PublicKey("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo");
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
   throw new Error('Missing environment variables.');
@@ -43,77 +37,66 @@ async function performSwap(
   inputMint: string,
   outputMint: string,
   amount: number,
-  slippageBps: number
+  slippageBps: number,
+  isPanicSell: boolean = false
 ): Promise<{ txid: string; quote: QuoteResponse }> {
-    console.log(`[Swap] Getting quote from Jupiter...`);
-    const quote = await jupiterApi.quoteGet({
-        inputMint, outputMint, amount, slippageBps,
-        asLegacyTransaction: false,
-    });
-    if (!quote) throw new Error('Failed to get a quote from Jupiter.');
+  console.log(`[Swap] Getting quote from Jupiter...`);
 
-    console.log(`[Swap] Manually building transaction for QuickNode Fastlane...`);
+  const quote = await jupiterApi.quoteGet({
+    inputMint,
+    outputMint,
+    amount,
+    slippageBps,
+    // @ts-ignore
+    // Use dynamic fees to automatically find the best fee for the network.
+    priorityFeeLevel: isPanicSell ? 'TURBO' : 'VERY_HIGH',
+    asLegacyTransaction: false,
+  });
 
-    // @ts-ignore - Bypassing a local editor error. This property exists.
-    const { computeBudgetInstructions, setupInstructions, swapInstruction, cleanupInstruction, addressLookupTableAccounts: addressLookupTableKeys } = 
-      await jupiterApi.swapInstructionsPost({
-        swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58() },
-    });
+  if (!quote) {
+    throw new Error('Failed to get a quote from Jupiter.');
+  }
 
-    const instructions = [
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000_000 }),
-        ...computeBudgetInstructions,
-        ...setupInstructions,
-        swapInstruction,
-        ...(cleanupInstruction ? [cleanupInstruction] : []),
-        SystemProgram.transfer({
-            fromPubkey: walletKeypair.publicKey,
-            toPubkey: JITO_TIP_ACCOUNT,
-            lamports: 1_000_000,
-        }),
-    ].filter((ix): ix is TransactionInstruction => !!ix);
+  // Let Jupiter build the full transaction, which we know works.
+  const swapResult = await jupiterApi.swapPost({
+    swapRequest: {
+      quoteResponse: quote,
+      userPublicKey: walletKeypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+    },
+  });
 
-    // Get Address Lookup Tables
-    const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
-    if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
-        const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
-            addressLookupTableKeys.map((key: string) => new PublicKey(key))
-        );
-        for (let i = 0; i < lookupTableAccountInfos.length; i++) {
-            const accountInfo = lookupTableAccountInfos[i];
-            const tableKey = addressLookupTableKeys[i];
-            if (accountInfo) {
-                addressLookupTableAccounts.push(
-                    new AddressLookupTableAccount({
-                        key: new PublicKey(tableKey),
-                        state: AddressLookupTableAccount.deserialize(accountInfo.data),
-                    })
-                );
-            }
-        }
-    }
-    
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    const messageV0 = new TransactionMessage({
-        payerKey: walletKeypair.publicKey,
-        recentBlockhash: blockhash,
-        instructions,
-    }).compileToV0Message(addressLookupTableAccounts);
-    
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([walletKeypair]);
-    const rawTransaction = transaction.serialize();
+  const swapTransactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
+  const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+  transaction.sign([walletKeypair]);
 
-    console.log(`[Swap] Sending transaction via Fastlane...`);
-    const txid = await connection.sendRawTransaction(rawTransaction, { skipPreflight: true, maxRetries: 5 });
-    const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
-    if (confirmation.value.err) throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+  const rawTransaction = transaction.serialize();
+  
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+  
+  const txid = await connection.sendRawTransaction(rawTransaction, {
+    skipPreflight: true,
+    maxRetries: 5,
+  });
 
-    console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
-    return { txid, quote };
+  const confirmation = await connection.confirmTransaction(
+    { 
+      signature: txid, 
+      blockhash: blockhash,
+      lastValidBlockHeight: lastValidBlockHeight
+    },
+    'confirmed'
+  );
+
+  if (confirmation.value.err) {
+    throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+  }
+  
+  console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
+  return { txid, quote };
 }
 
-// The 'executeTrade' function requires no changes.
+// The 'executeTrade' function remains unchanged.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
@@ -131,12 +114,11 @@ export async function executeTrade(
                 const amountInLamports = Math.round(solAmount * 10 ** 9);
                 const { txid, quote } = await performSwap(SOL_MINT_ADDRESS, tokenAddress, amountInLamports, currentSlippage);
                 const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
-                
                 console.log(`📝 Logging BUY trade to database...`);
                 await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount, tokenAmount: tokenAmountReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
                 await managePosition({ signal_id: signalId, status: 'open', tokenAddress, solSpent: solAmount, tokenReceived: tokenAmountReceived, openedAt: new Date() });
                 console.log(`🎉 Successfully opened position for Signal ID: ${signalId}`);
-            } else { // Handle SELL action
+            } else {
                 console.log(`🔍 Checking for open position for Signal ID: ${signalId}...`);
                 const position = await getOpenPositionBySignalId(signalId);
                 if (!position) {
@@ -146,12 +128,10 @@ export async function executeTrade(
                 }
                 console.log(`✅ Position found. Preparing to sell ${position.tokenReceived.toFixed(2)} tokens.`);
                 console.log(`💰 Executing SELL with ${currentSlippage / 100}% slippage.`);
-
                 const tokenDecimals = await getTokenDecimals(position.tokenAddress);
                 const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
                 const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, currentSlippage);
                 const solReceived = Number(quote.outAmount) / 10 ** 9;
-                
                 console.log(`📝 Logging SELL trade to database...`);
                 await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
                 await closePosition(String(signalId), txid, solReceived);
@@ -161,8 +141,25 @@ export async function executeTrade(
             return;
         } catch (error: any) {
             console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
-
             if (i === slippageSettings.length - 1) {
+                 if (action === 'SELL') {
+                    console.log(`\n--- [FINAL ATTEMPT - PANIC SELL] ---`);
+                    try {
+                        const position = await getOpenPositionBySignalId(signalId);
+                        if (!position) throw new Error("Position not found for panic sell.");
+                        const tokenDecimals = await getTokenDecimals(position.tokenAddress);
+                        const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
+                        const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, 9000, true);
+                        const solReceived = Number(quote.outAmount) / 10 ** 9;
+                        await logTradeToFirestore({ txid, status: 'Success (Panic)', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: 9000, date: new Date(), signal_id: signalId });
+                        await closePosition(String(signalId), txid, solReceived);
+                        console.log(`🎉 Successfully PANIC SOLD and closed position for Signal ID: ${signalId}`);
+                        console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                        return;
+                    } catch (panicError: any) {
+                        console.error(`🛑 [FATAL] PANIC SELL FAILED for Signal ID ${signalId}:`, panicError.message);
+                    }
+                }
                 console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
                 await logTradeToFirestore({ txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0, tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId });
                 console.log(`================== [SIGNAL ${signalId} END] ======================`);
