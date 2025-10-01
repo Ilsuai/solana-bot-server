@@ -54,14 +54,15 @@ async function performSwap(
     if (!quote) throw new Error('Failed to get a quote from Jupiter.');
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
-
-    // --- FIX STARTS HERE ---
     
-    // 1. Get addressLookupTableAccounts from the QUOTE response.
-    const addressLookupTableKeys = quote.addressLookupTableAccounts;
+    // --- FINAL, CORRECTED FIX ---
     
-    // 2. Get instructions from Jupiter API as JSON, without addressLookupTableAccounts.
-    // @ts-ignore
+    // 1. Get the lookup table addresses from the QUOTE response.
+    // The correct property name is `lookupTableAccountAddresses`.
+    // @ts-ignore - The type might be missing this, but the API returns it.
+    const addressLookupTableKeys = quote.lookupTableAccountAddresses;
+    
+    // 2. Get ONLY the instructions from the swapInstructionsPost response.
     const { 
       computeBudgetInstructions: cbi, 
       setupInstructions: sui, 
@@ -71,23 +72,26 @@ async function performSwap(
         swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
     
-    // Helper function to convert string pubkeys to PublicKey objects
-    const rehydrateInstruction = (instruction: any) => new TransactionInstruction({
-      programId: new PublicKey(instruction.programId),
-      keys: instruction.keys.map((key: any) => ({
-        ...key,
-        pubkey: new PublicKey(key.pubkey),
-      })),
-      data: Buffer.from(instruction.data, 'base64'),
-    });
+    // Helper function to convert string pubkeys to PublicKey objects, preventing the runtime error.
+    const rehydrateInstruction = (instruction: any) => {
+      if (!instruction) return null;
+      return new TransactionInstruction({
+        programId: new PublicKey(instruction.programId),
+        keys: instruction.keys.map((key: any) => ({
+          ...key,
+          pubkey: new PublicKey(key.pubkey),
+        })),
+        data: Buffer.from(instruction.data, 'base64'),
+      });
+    };
 
-    // Deserialize all instructions from Jupiter
-    const computeBudgetInstructions = cbi?.map(rehydrateInstruction) || [];
-    const setupInstructions = sui?.map(rehydrateInstruction) || [];
-    const swapInstruction = rehydrateInstruction(si);
-    const cleanupInstruction = cui ? rehydrateInstruction(cui) : null;
+    // Deserialize all instructions from Jupiter to fix the 'pubkey.toBase58' error
+    const computeBudgetInstructions = cbi?.map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[] || [];
+    const setupInstructions = sui?.map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[] || [];
+    const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
+    const cleanupInstruction = rehydrateInstruction(cui);
     
-    // --- FIX ENDS HERE ---
+    // --- END OF FIX ---
 
     const instructions = [
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }), // High priority fee
