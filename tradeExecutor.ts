@@ -98,7 +98,6 @@ async function performSwap(
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
     
-    // 1. Get instructions and lookup table addresses from Jupiter
     const { 
       setupInstructions: sui, swapInstruction: si, cleanupInstruction: cui,
     } = await jupiterApi.swapInstructionsPost({
@@ -107,7 +106,6 @@ async function performSwap(
     // @ts-ignore
     const addressLookupTableKeys = quote.lookupTableAccountAddresses;
     
-    // 2. Prepare Address Lookup Table Accounts FIRST
     const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
     if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
         const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
@@ -136,7 +134,6 @@ async function performSwap(
     const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
     const cleanupInstruction = rehydrateInstruction(cui);
     
-    // 3. Prepare core instructions (including tip)
     const tipAmountSOL = await getDynamicTipAmount();
     const tipInstruction = SystemProgram.transfer({
         fromPubkey: walletKeypair.publicKey,
@@ -150,7 +147,6 @@ async function performSwap(
         tipInstruction,
     ].filter((ix): ix is TransactionInstruction => !!ix);
 
-    // 4. Get fees and simulate WITH lookup tables
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     const priorityFee = await getPriorityFee(instructionsForFeeAndCU, addressLookupTableAccounts);
     
@@ -163,14 +159,33 @@ async function performSwap(
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
     }).compileToV0Message(addressLookupTableAccounts);
     
-    const simResult = await connection.simulateTransaction(new VersionedTransaction(testMessage), { sigVerify: false });
+    const accountsFromLookups: PublicKey[] = [];
+    addressLookupTableAccounts.forEach(table => {
+        accountsFromLookups.push(...table.state.addresses);
+    });
+
+    // --- FIX IS HERE ---
+    // The simulation's 'accounts' config requires base64 encoding.
+    const accountKeysForSim = accountsFromLookups.map(key => key.toBuffer().toString('base64'));
+
+    const simResult = await connection.simulateTransaction(
+        new VersionedTransaction(testMessage), 
+        { 
+            sigVerify: false,
+            accounts: {
+                encoding: "base64", // Must be "base64"
+                addresses: accountKeysForSim, // Must be base64 encoded strings
+            }
+        }
+    );
+    // --- END OF FIX ---
+
     if (simResult.value.err || !simResult.value.unitsConsumed) {
         throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
     }
     const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
     console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
 
-    // 5. Build final transaction with all optimizations
     const finalInstructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
