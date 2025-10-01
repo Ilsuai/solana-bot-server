@@ -3,10 +3,10 @@ import {
   PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction,
 } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getMint, getAccount, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
-import { createJupiterApiClient, QuoteGetRequest, QuoteResponse } from '@jup-ag/api';
+import { createJupiterApiClient, QuoteGetRequest } from '@jup-ag/api';
 import bs58 from 'bs58';
 import fetch from 'node-fetch';
-import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
+import { logTradeToFirestore } from './firebaseAdmin';
 
 // --- CONFIG ---
 if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
@@ -35,6 +35,7 @@ async function getWalletTokenBalance(mintStr: string): Promise<bigint> {
     try {
       const ata = await getAssociatedTokenAddress(mint, walletKeypair.publicKey, false, programId);
       const acc = await getAccount(connection, ata, 'confirmed', programId);
+      console.log(`[Balance] Found token balance for ${mintStr.slice(0,4)}...: ${acc.amount}`);
       return acc.amount;
     } catch (_) { /* try next program id */ }
   }
@@ -43,19 +44,22 @@ async function getWalletTokenBalance(mintStr: string): Promise<bigint> {
 
 async function getTokenDecimals(mintAddress: string): Promise<number> {
   const pk = new PublicKey(mintAddress);
-  // Try legacy SPL first
   for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
     try {
-      return (await getMint(connection, pk, 'confirmed', programId)).decimals;
+      const decimals = (await getMint(connection, pk, 'confirmed', programId)).decimals;
+      console.log(`[Decimals] Found ${decimals} decimals for ${mintAddress.slice(0,4)}... using SPL Token program.`);
+      return decimals;
     } catch (_) {}
   }
-  // Final fallback: Jupiter Token API
   try {
     const res = await fetch(`https://token.jup.ag/v2/mint?mints=${mintAddress}`);
     if(!res.ok) throw new Error(`Jupiter Token API failed with status ${res.status}`);
-    const json = await res.json() as { data: { decimals: number }[] };
-    const d = json?.data?.[0]?.decimals;
-    if (typeof d === 'number') return d;
+    const json = await res.json() as any;
+    const d = json?.[0]?.decimals;
+    if (typeof d === 'number') {
+        console.log(`[Decimals] Found ${d} decimals for ${mintAddress.slice(0,4)}... using Jupiter API fallback.`);
+        return d;
+    }
   } catch (e) {
       console.warn(`[Decimals] Jupiter Token API fallback failed: ${(e as Error).message}`);
   }
@@ -65,15 +69,16 @@ async function getTokenDecimals(mintAddress: string): Promise<number> {
 async function getPriorityFeeEstimate(transaction: VersionedTransaction): Promise<number> {
     try {
         const response = await fetch(connection.rpcEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 jsonrpc: '2.0', id: '1', method: 'getPriorityFeeEstimate',
                 params: [{ transaction: bs58.encode(transaction.serialize()), options: { includeAllFees: true } }],
             }),
         });
         const data = await response.json() as any;
-        return data.result?.priorityFeeEstimate || 500000;
+        const fee = data.result?.priorityFeeEstimate || 500000;
+        console.log(`[Priority Fee] Using dynamic fee: ${fee.toLocaleString()} microLamports`);
+        return fee;
     } catch (error) {
         console.warn("[Priority Fee] Failed to get dynamic fee, using fallback.", error);
         return 500000;
@@ -83,24 +88,28 @@ async function getPriorityFeeEstimate(transaction: VersionedTransaction): Promis
 async function ensureSolBufferOrGetTip(minSol: number = 0.02): Promise<number> {
   const balLamports = await connection.getBalance(walletKeypair.publicKey, 'processed');
   const balSol = balLamports / LAMPORTS_PER_SOL;
+  console.log(`[Check] Current SOL Balance: ${balSol.toFixed(4)}`);
 
-  let tipSol = 0.001; // Default tip
-  const estFeeSol = 0.0006; // Rough fee budget
+  let tipSol = 0.001;
+  const estFeeSol = 0.0006; 
   if (balSol < minSol + tipSol + estFeeSol) {
     tipSol = Math.max(0.0003, Math.max(0, balSol - (minSol + estFeeSol)));
-    console.warn(`[SOL Buffer] Low SOL balance (${balSol.toFixed(4)}). Scaling tip down to ${tipSol} SOL.`);
+    console.warn(`[SOL Buffer] Low SOL balance. Scaling tip down to ${tipSol} SOL.`);
   }
   if (tipSol <= 0) throw new Error(`Insufficient SOL for fees + tip. Balance: ${balSol.toFixed(4)}, Required minimum: ${minSol}`);
   return tipSol;
 }
 
-const rehydrateInstruction = (instruction: any) => new TransactionInstruction({
-  programId: new PublicKey(instruction.programId),
-  keys: (instruction.accounts || []).map((key: any) => ({
-    pubkey: new PublicKey(key.pubkey), isSigner: key.isSigner, isWritable: key.isWritable,
-  })),
-  data: Buffer.from(instruction.data, 'base64'),
-});
+const rehydrateInstruction = (instruction: any): TransactionInstruction | null => {
+    if (!instruction) return null;
+    return new TransactionInstruction({
+        programId: new PublicKey(instruction.programId),
+        keys: (instruction.accounts || []).map((key: any) => ({
+            pubkey: new PublicKey(key.pubkey), isSigner: key.isSigner, isWritable: key.isWritable,
+        })),
+        data: Buffer.from(instruction.data, 'base64'),
+    });
+};
 
 // --- CORE TRADE LOGIC ---
 
@@ -126,7 +135,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       
       amountInSmallestUnit = (balance * 9999n) / 10000n; // Sell 99.99% to leave dust
       const amountToSellFloat = Number(amountInSmallestUnit) / (10 ** tokenDecimals);
-      console.log(`🔴 Executing SELL of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'}`);
+      console.log(`🔴 Executing SELL of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'} (raw: ${amountInSmallestUnit})`);
     }
 
     const quote = await jupiterApi.quoteGet({
@@ -134,7 +143,8 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       slippageBps: 1500, asLegacyTransaction: false,
     });
     if (!quote) throw new Error("Failed to get quote from Jupiter.");
-
+    console.log(`[Jupiter] Quote received. Min out: ${Number(quote.outAmount) / (10 ** (action === 'BUY' ? tokenDecimals : 9))}`);
+    
     const { 
       swapInstruction: si, setupInstructions: sui, cleanupInstruction: cui, addressLookupTableAddresses,
     } = await jupiterApi.swapInstructionsPost({
@@ -159,6 +169,9 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
         if (!accountInfo) throw new Error(`Could not fetch ALT account info for ${address}`);
         return new AddressLookupTableAccount({ key: new PublicKey(address), state: AddressLookupTableAccount.deserialize(accountInfo.data) });
     }));
+    if (lookupTableAccounts.length > 0) {
+        console.log(`[Build] Found and loaded ${lookupTableAccounts.length} Address Lookup Tables.`);
+    }
     
     let tempMessage = new TransactionMessage({
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: [...instructions, tipInstruction],
@@ -178,7 +191,9 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     
     const simResult = await connection.simulateTransaction(tempTransaction, { sigVerify: false, replaceRecentBlockhash: true });
     if (simResult.value.err) throw new Error(`Simulation failed: ${JSON.stringify(simResult.value.err)}`);
-    const computeUnits = Math.ceil(simResult.value.unitsConsumed! * 1.2);
+    const unitsConsumed = simResult.value.unitsConsumed!;
+    const computeUnits = Math.ceil(unitsConsumed * 1.2);
+    console.log(`[Simulate] Units consumed: ${unitsConsumed}. Setting limit with 20% margin: ${computeUnits}`);
 
     const finalInstructions = [
       ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
@@ -193,6 +208,8 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     
     const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
     const senderUrl = `http://ewr-sender.helius-rpc.com/fast?api-key=${apiKey}`;
+    
+    console.log(`[Helius] Sending transaction...`);
     const response = await fetch(senderUrl, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -203,15 +220,16 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const json = await response.json() as any;
     if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
     const txid = json.result;
+    if (!txid) throw new Error('Helius Sender did not return a transaction signature.');
+    console.log(`[Helius] Transaction sent successfully. Signature: ${txid}`);
     
+    console.log(`[Confirm] Waiting for transaction confirmation...`);
     const confResult = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
     if (confResult.value.err) throw new Error(`Confirmation failed: ${JSON.stringify(confResult.value.err)}`);
 
     console.log(`✅ Swap successful! Tx: https://solscan.io/tx/${txid}`);
     
-    // Final logging can be customized here
     await logTradeToFirestore({ txid, signal_id, action, symbol });
-
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
 
   } catch (error: any) {
