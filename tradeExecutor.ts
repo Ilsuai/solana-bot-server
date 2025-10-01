@@ -159,22 +159,20 @@ async function performSwap(
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
     }).compileToV0Message(addressLookupTableAccounts);
     
+    // --- FIX IS HERE ---
     const accountsFromLookups: PublicKey[] = [];
     addressLookupTableAccounts.forEach(table => {
         accountsFromLookups.push(...table.state.addresses);
     });
 
-    // --- FIX IS HERE ---
-    // The simulation's 'accounts' config requires base64 encoding.
-    const accountKeysForSim = accountsFromLookups.map(key => key.toBuffer().toString('base64'));
-
     const simResult = await connection.simulateTransaction(
         new VersionedTransaction(testMessage), 
         { 
             sigVerify: false,
+            // Manually provide the accounts from the lookup tables to the simulation
             accounts: {
-                encoding: "base64", // Must be "base64"
-                addresses: accountKeysForSim, // Must be base64 encoded strings
+                encoding: "base64",
+                addresses: accountsFromLookups.map(key => key.toBuffer().toString('base64')),
             }
         }
     );
