@@ -2,7 +2,26 @@ import express, { Request, Response } from 'express';
 import { executeTrade } from './tradeExecutor';
 import { initializeFirebase } from './firebaseAdmin';
 
-// Initialize Firebase Admin SDK at the start
+// --- Bot Startup Log ---
+console.log("==================================================");
+console.log("  Solana Trading Bot - Starting Up");
+console.log("==================================================");
+
+const rpcUrl = process.env.SOLANA_RPC_ENDPOINT;
+if (rpcUrl) {
+    try {
+        const url = new URL(rpcUrl);
+        console.log(`✅ CONNECTED TO RPC ENDPOINT: ${url.hostname}`);
+    } catch (error) {
+        console.error("❌ Invalid SOLANA_RPC_ENDPOINT URL format.");
+    }
+} else {
+    console.log("❌ SOLANA_RPC_ENDPOINT environment variable not set!");
+}
+console.log("--------------------------------------------------");
+// --- End of Startup Log ---
+
+// Initialize Firebase Admin SDK
 initializeFirebase();
 
 const app = express();
@@ -10,7 +29,6 @@ const port = process.env.PORT || 3001;
 
 app.use(express.json());
 
-// The Webhook handler for NextGen AI signals
 app.post('/nexagent-signal', async (req: Request, res: Response) => {
     const signalId = req.body.data?.signal_id || 'Unknown';
     console.log(`\n================== [SIGNAL ${signalId} RECEIVED] ==================`);

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node dist/index.js",
     "build": "tsc",
-    "test:speed": "ts-node src/speed-test.ts"
+    "test:speed": "ts-node speed-test.ts"
   },
   "author": "",
   "license": "ISC",
