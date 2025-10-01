@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { executeTrade } from './tradeExecutor';
+import { executeTradeFromSignal, TradeSignal } from './tradeExecutor'; // Import new function and type
 import { initializeFirebase } from './firebaseAdmin';
 import fetch from 'node-fetch';
 
@@ -39,7 +39,6 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
         const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
         if (!payloadData || payloadData.transaction_type !== 'swap') {
-            console.log(`❌ Validation Failed: Signal is not a valid swap transaction.`);
             return res.status(400).send('Invalid or unrecognized signal payload.');
         }
 
@@ -50,19 +49,21 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
             action = 'SELL';
         }
 
-        const tokenAddress = action === 'BUY' ? payloadData.output_mint : payloadData.input_mint;
-        const amountFromSignal = payloadData.input_amount;
-        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
-
-        if (!action || !tokenAddress || !signalId || !amountFromSignal || amountFromSignal <= 0) {
-             console.log(`❌ Validation Failed: Incomplete parameters (action, tokenAddress, signalId, or amount).`);
-             return res.status(400).send('Failed to extract necessary trade parameters from signal.');
+        if (!action) {
+            return res.status(400).send('Could not determine BUY/SELL action from signal.');
         }
-        
-        console.log(`✅ Signal Validated: ${action} ${tokenSymbol || 'token'} (${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)})`);
 
-        executeTrade(tokenAddress, action, amountFromSignal, signalId, tokenSymbol).catch(error => {
-            console.error(`CRITICAL ASYNC ERROR for Signal ${signalId}:`, error.message);
+        const tradeSignal: TradeSignal = {
+            action: action,
+            signal_id: payloadData.signal_id,
+            input_mint: payloadData.input_mint,
+            output_mint: payloadData.output_mint,
+            input_amount: payloadData.input_amount,
+            symbol: action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol,
+        };
+
+        executeTradeFromSignal(tradeSignal).catch(error => {
+            console.error(`CRITICAL ASYNC ERROR for Signal ${tradeSignal.signal_id}:`, (error as Error).message);
         });
 
         res.status(200).send('Webhook received and trade initiated.');
@@ -83,7 +84,6 @@ app.listen(port, () => {
     const apiKey = process.env.SOLANA_RPC_ENDPOINT?.split('api-key=')[1];
     if (apiKey) {
         const senderPingUrl = `http://ewr-sender.helius-rpc.com/ping?api-key=${apiKey}`;
-
         const warmConnection = async () => {
             try {
                 // @ts-ignore
@@ -97,12 +97,9 @@ app.listen(port, () => {
                 console.error('[Warmup] Ping failed with error:', (error as Error).message);
             }
         };
-
         warmConnection();
-        
-        // --- UPDATED PING INTERVAL ---
-        setInterval(warmConnection, 50000); // 50,000 milliseconds = 50 seconds
+        setInterval(warmConnection, 50000);
     } else {
-        console.warn('[Warmup] Could not start connection warmer: API key not found in SOLANA_RPC_ENDPOINT.');
+        console.warn('[Warmup] Could not start connection warmer: API key not found.');
     }
 });
