@@ -141,56 +141,22 @@ async function performSwap(
         lamports: tipAmountSOL * LAMPORTS_PER_SOL,
     });
 
-    const instructionsForFeeAndCU = [
+    const instructionsWithoutFees = [
         ...setupInstructions, swapInstruction,
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         tipInstruction,
     ].filter((ix): ix is TransactionInstruction => !!ix);
 
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    const priorityFee = await getPriorityFee(instructionsForFeeAndCU, addressLookupTableAccounts);
-    
-    const testInstructionsForCU = [
+    const priorityFee = await getPriorityFee(instructionsWithoutFees, addressLookupTableAccounts);
+
+    console.log(`[Compute Units] Bypassing simulation. Using fixed limit: 1,400,000`);
+    const finalInstructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
-    ];
-    const testMessage = new TransactionMessage({
-        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
-    }).compileToV0Message(addressLookupTableAccounts);
-    
-    // --- FIX IS HERE ---
-    const accountsFromLookups: PublicKey[] = [];
-    addressLookupTableAccounts.forEach(table => {
-        accountsFromLookups.push(...table.state.addresses);
-    });
-
-    const simResult = await connection.simulateTransaction(
-        new VersionedTransaction(testMessage), 
-        { 
-            sigVerify: false,
-            replaceRecentBlockhash: true,
-            // The `accounts` property must be an object with an `encoding` and `addresses` field.
-            accounts: {
-                encoding: "base64",
-                addresses: accountsFromLookups.map(key => key.toBuffer().toString("base64")),
-            },
-        }
-    );
-    // --- END OF FIX ---
-
-    if (simResult.value.err || !simResult.value.unitsConsumed) {
-        throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
-    }
-    const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
-    console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
-
-    const finalInstructions = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
+        ...instructionsWithoutFees,
     ];
 
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     const messageV0 = new TransactionMessage({
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: finalInstructions,
     }).compileToV0Message(addressLookupTableAccounts);
