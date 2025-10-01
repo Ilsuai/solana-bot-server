@@ -188,7 +188,13 @@ async function performSwap(
     
     const txid = json.result;
     const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
-    if (confirmation.value.err) throw new Error(`Transaction confirmation failed: ${confirmation.value.err.toString()}`);
+    
+    // --- FIX IS HERE: IMPROVED ERROR LOGGING ---
+    if (confirmation.value.err) {
+        console.error('[Confirmation Error]', confirmation.value.err);
+        throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+    // --- END OF FIX ---
 
     console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
     return { txid, quote };
