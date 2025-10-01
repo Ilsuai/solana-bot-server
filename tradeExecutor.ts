@@ -3,7 +3,7 @@ import {
   PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction,
 } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getMint, getAccount, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
-import { createJupiterApiClient, QuoteGetRequest } from '@jup-ag/api';
+import { createJupiterApiClient } from '@jup-ag/api';
 import bs58 from 'bs58';
 import fetch from 'node-fetch';
 import { logTradeToFirestore } from './firebaseAdmin';
@@ -15,7 +15,7 @@ if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
 const jupiterApi = createJupiterApiClient();
-const JITO_TIP_ACCOUNTS = (process.env.JITO_TIP_ACCOUNTS || "96gYgAKpdZvy5M2sZpSoe6W6h4scqw4v9v7K6h4xW6h4,HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo").split(',').map(k => new PublicKey(k));
+const JITO_TIP_ACCOUNTS = (process.env.JITO_TIP_ACCOUNTS || "96gYgAKpdZvy5M2sZpSoe6W6h4scqw4v9v7K6h4xW6h4,HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo,D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ").split(',').map(k => new PublicKey(k));
 
 // --- TYPES ---
 export type TradeSignal = {
@@ -214,7 +214,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             jsonrpc: '2.0', id: '1', method: 'sendTransaction',
-            params: [ bs58.encode(finalTransaction.serialize()), { encoding: "base58", skipPreflight: true } ],
+            params: [ Buffer.from(finalTransaction.serialize()).toString('base64'), { encoding: "base64", skipPreflight: true } ],
         }),
     });
     const json = await response.json() as any;
