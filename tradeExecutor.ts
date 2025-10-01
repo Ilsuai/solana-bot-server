@@ -8,7 +8,6 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   TransactionInstruction,
-  PublicKeyInitData,
 } from '@solana/web3.js';
 import {
   createJupiterApiClient,
@@ -78,7 +77,7 @@ async function performSwap(
     const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
     if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
         const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
-            addressLookupTableKeys.map((key: PublicKeyInitData) => new PublicKey(key))
+            addressLookupTableKeys.map((key: string) => new PublicKey(key))
         );
         for (let i = 0; i < lookupTableAccountInfos.length; i++) {
             const accountInfo = lookupTableAccountInfos[i];
