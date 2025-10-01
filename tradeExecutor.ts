@@ -169,11 +169,12 @@ async function performSwap(
         new VersionedTransaction(testMessage), 
         { 
             sigVerify: false,
-            // Manually provide the accounts from the lookup tables to the simulation
+            replaceRecentBlockhash: true,
+            // The `accounts` property must be an object with an `encoding` and `addresses` field.
             accounts: {
                 encoding: "base64",
-                addresses: accountsFromLookups.map(key => key.toBuffer().toString('base64')),
-            }
+                addresses: accountsFromLookups.map(key => key.toBuffer().toString("base64")),
+            },
         }
     );
     // --- END OF FIX ---
