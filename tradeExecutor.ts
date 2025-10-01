@@ -1,383 +1,287 @@
-// tradeExecutor.ts
-import 'dotenv/config';
 import {
-  AddressLookupTableAccount,
-  ComputeBudgetProgram,
   Connection,
   Keypair,
-  LAMPORTS_PER_SOL,
+  VersionedTransaction,
   PublicKey,
+  TransactionMessage,
+  AddressLookupTableAccount,
+  ComputeBudgetProgram,
   SystemProgram,
   TransactionInstruction,
-  TransactionMessage,
-  VersionedTransaction,
+  LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
-import { createJupiterApiClient, QuoteGetRequest } from '@jup-ag/api';
+import {
+  createJupiterApiClient,
+  QuoteResponse,
+} from '@jup-ag/api';
+import { getMint } from '@solana/spl-token';
+import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
+import fetch from 'node-fetch';
 
-/**
- * =======================
- * ENV / CONFIG
- * =======================
- */
-const {
-  RPC_URL = '',
-  HELIUS_RPC = '', // preferred: your Helius endpoint
-  WALLET_SECRET = '',
-  JITO_TIP_ACCOUNTS = 'GvHe7qZLkqQ1gCxy3xS6wqL9r8n9p7k8ZK7j1oTip111,5bNf1NhJitoTips11111111111111111111111111',
-} = process.env;
+const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
-if (!HELIUS_RPC && !RPC_URL) {
-  throw new Error('Set HELIUS_RPC (preferred) or RPC_URL in your env');
+const JITO_TIP_ACCOUNTS = [
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF", "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or", "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
+].map(a => new PublicKey(a));
+
+if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
+  throw new Error('Missing environment variables.');
 }
 
-if (!WALLET_SECRET) {
-  throw new Error('Set WALLET_SECRET (base58) in your env');
-}
-
-const connection = new Connection(HELIUS_RPC || RPC_URL, {
-  commitment: 'processed',
-});
-const walletKeypair = Keypair.fromSecretKey(bs58.decode(WALLET_SECRET));
-
-// Jito tip accounts list
-const JITO_TIP_LIST = JITO_TIP_ACCOUNTS.split(',').map((s) => s.trim()).filter(Boolean);
-
-// Jupiter client
+const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
+const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const jupiterApi = createJupiterApiClient();
 
-/**
- * =======================
- * UTILS / STUBS
- * =======================
- */
-
-// Basic Firestore logger stub to avoid build errors.
-// Replace with your real Firestore call if you want.
-async function logTradeToFirestore(entry: Record<string, any>) {
-  try {
-    // no-op in this stub
-    console.log('[FirestoreLog]', JSON.stringify(entry));
-  } catch {
-    // swallow
-  }
-}
-
-// Dynamic Jito tip selection; you can wire this to your latency/tip oracle later.
 async function getDynamicTipAmount(): Promise<number> {
-  // 0.001 SOL default tip; adjust as needed or query a live source
+  try {
+    const response = await fetch('https://bundles.jito.wtf/api/v1/bundles/tip_floor');
+    const data = await response.json() as any;
+    if (data && data[0] && typeof data[0].landed_tips_75th_percentile === 'number') {
+      const tip75th = data[0].landed_tips_75th_percentile;
+      const dynamicTip = Math.max(tip75th, 0.001);
+      console.log(`[Tip] Using dynamic Jito tip: ${dynamicTip} SOL`);
+      return dynamicTip;
+    }
+  } catch (error) {
+    console.warn('[Tip] Failed to fetch dynamic tip amount, using fallback.', error);
+  }
   return 0.001;
 }
 
-// Helius getPriorityFeeEstimate. Returns microLamports-per-CU (number).
-async function getPriorityFeeEstimateMicroLamports(serializedTxBase64: string): Promise<number | null> {
-  const endpoint = HELIUS_RPC || RPC_URL;
-  if (!endpoint) return null;
-
+async function getPriorityFee(instructions: TransactionInstruction[], lookupTableAccounts: AddressLookupTableAccount[]): Promise<number> {
   try {
-    const body = {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getPriorityFeeEstimate',
-      params: [
-        {
-          transaction: serializedTxBase64,
-          options: {
-            // Return recommended; you can also request includeAllPriorityFeeLevels/details
-            recommended: true,
-          },
-        },
-      ],
-    };
+    const { blockhash } = await connection.getLatestBlockhash();
+    const testTxMessage = new TransactionMessage({
+      payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions,
+    }).compileToV0Message(lookupTableAccounts);
+    const testTx = new VersionedTransaction(testTxMessage);
 
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+    const response = await fetch(connection.rpcEndpoint, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: "1", method: "getPriorityFeeEstimate",
+        params: [{ transaction: bs58.encode(testTx.serialize()), options: { includeAllFees: true } }],
+      }),
+    });
+    const data = await response.json() as any;
+    const fee = data.result?.priorityFeeEstimate || 500000;
+    console.log(`[Priority Fee] Using dynamic fee: ${fee} microLamports`);
+    return fee;
+  } catch (error) {
+    console.warn("[Priority Fee] Failed to get dynamic fee, using fallback.", error);
+    return 500000;
+  }
+}
+
+async function getTokenDecimals(mintAddress: string): Promise<number> {
+    if (mintAddress === SOL_MINT_ADDRESS) return 9;
+    try {
+        const mintPublicKey = new PublicKey(mintAddress);
+        const mintInfo = await getMint(connection, mintPublicKey);
+        return mintInfo.decimals;
+    } catch (error) {
+        throw new Error(`Could not fetch decimals for token ${mintAddress}.`);
+    }
+}
+
+async function performSwap(
+  inputMint: string, outputMint: string, amount: number, slippageBps: number
+): Promise<{ txid: string; quote: QuoteResponse }> {
+    console.log(`[Swap] Getting quote from Jupiter...`);
+    const quote = await jupiterApi.quoteGet({ inputMint, outputMint, amount, slippageBps, asLegacyTransaction: false });
+    if (!quote) throw new Error('Failed to get a quote from Jupiter.');
+
+    console.log(`[Swap] Building transaction for Helius Sender...`);
+    
+    const { 
+      setupInstructions: sui, swapInstruction: si, cleanupInstruction: cui,
+    } = await jupiterApi.swapInstructionsPost({
+        swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
+    });
+    // @ts-ignore
+    const addressLookupTableKeys = quote.lookupTableAccountAddresses;
+    
+    const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
+    if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
+        const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
+            addressLookupTableKeys.map((key: string) => new PublicKey(key))
+        );
+        for (let i = 0; i < lookupTableAccountInfos.length; i++) {
+            if (lookupTableAccountInfos[i]) {
+                addressLookupTableAccounts.push(new AddressLookupTableAccount({
+                    key: new PublicKey(addressLookupTableKeys[i]),
+                    state: AddressLookupTableAccount.deserialize(lookupTableAccountInfos[i]!.data),
+                }));
+            }
+        }
+    }
+
+    // --- FIX IS HERE ---
+    // Use `instruction.accounts` which is the correct property from Jupiter's API response.
+    const rehydrateInstruction = (instruction: any) => {
+      if (!instruction) return null;
+      return new TransactionInstruction({
+        programId: new PublicKey(instruction.programId),
+        keys: (instruction.accounts || []).map((key: any) => ({
+          pubkey: new PublicKey(key.pubkey),
+          isSigner: key.isSigner,
+          isWritable: key.isWritable,
+        })),
+        data: Buffer.from(instruction.data, 'base64'),
+      });
+    };
+    // --- END OF FIX ---
+    
+    const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
+    const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
+    const cleanupInstruction = rehydrateInstruction(cui);
+    
+    const tipAmountSOL = await getDynamicTipAmount();
+    const tipInstruction = SystemProgram.transfer({
+        fromPubkey: walletKeypair.publicKey,
+        toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
+        lamports: tipAmountSOL * LAMPORTS_PER_SOL,
     });
 
-    if (!res.ok) {
-      console.warn('[PriorityFee] HTTP', res.status, await res.text());
-      return null;
-    }
-    const json = await res.json();
-    // Helius returns something like { result: { priorityFeeEstimate: number, ... } }
-    const microLamports: number | undefined =
-      json?.result?.priorityFeeEstimate ?? json?.result?.recommended?.microLamports;
-    if (typeof microLamports === 'number' && Number.isFinite(microLamports)) {
-      return microLamports;
-    }
-    return null;
-  } catch (e) {
-    console.warn('[PriorityFee] Error', (e as Error).message);
-    return null;
-  }
-}
+    const instructionsForFeeAndCU = [
+        ...setupInstructions, swapInstruction,
+        ...(cleanupInstruction ? [cleanupInstruction] : []),
+        tipInstruction,
+    ].filter((ix): ix is TransactionInstruction => !!ix);
 
-// Rehydrate a Jupiter instruction (they return `accounts`, not `keys`)
-const rehydrateInstruction = (instruction: any) => {
-  if (!instruction) return null;
-  return new TransactionInstruction({
-    programId: new PublicKey(instruction.programId),
-    keys: (instruction.accounts || []).map((acc: any) => ({
-      pubkey: new PublicKey(acc.pubkey),
-      isSigner: acc.isSigner,
-      isWritable: acc.isWritable,
-    })),
-    data: Buffer.from(instruction.data, 'base64'),
-  });
-};
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    const priorityFee = await getPriorityFee(instructionsForFeeAndCU, addressLookupTableAccounts);
+    
+    const testInstructionsForCU = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+        ...instructionsForFeeAndCU,
+    ];
+    const testMessage = new TransactionMessage({
+        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
+    }).compileToV0Message(addressLookupTableAccounts);
+    
+    const accountsFromLookups: PublicKey[] = [];
+    addressLookupTableAccounts.forEach(table => {
+        accountsFromLookups.push(...table.state.addresses);
+    });
 
-// Fetch ALT accounts from chain
-async function loadLookupTableAccounts(addresses: string[]): Promise<AddressLookupTableAccount[]> {
-  if (!addresses?.length) return [];
-  const pubkeys = addresses.map((a) => new PublicKey(a));
-  const infos = await connection.getMultipleAccountsInfo(pubkeys);
-  return infos
-    .map((info, i) => {
-      if (!info) return null;
-      try {
-        return new AddressLookupTableAccount({
-          key: pubkeys[i],
-          state: AddressLookupTableAccount.deserialize(info.data),
-        });
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean) as AddressLookupTableAccount[];
-}
+    const simResult = await connection.simulateTransaction(
+        new VersionedTransaction(testMessage), 
+        { 
+            sigVerify: false,
+            replaceRecentBlockhash: true,
+            accounts: {
+                encoding: "base64",
+                addresses: accountsFromLookups.map(key => key.toBuffer().toString("base64")),
+            },
+        }
+    );
 
-/**
- * =======================
- * CORE: EXECUTE TRADE
- * =======================
- */
-
-type TradeSignal = {
-  signal_id: number | string;
-  transaction_type: 'swap';
-  input_mint: string; // e.g., So111... for SOL
-  output_mint: string; // e.g., EPjF... for USDC
-  input_amount: number; // in SOL if input_mint is wrapped SOL
-  output_symbol?: string;
-};
-
-export async function executeTradeFromSignal(data: TradeSignal) {
-  const signalId = data.signal_id;
-  console.log(`================== [SIGNAL ${signalId} RECEIVED] ==================`);
-  console.log('Full Payload:', JSON.stringify({ data }, null, 2));
-
-  const slippageBpsAttempts = [500, 1500, 2500]; // 5%, 15%, 25%
-  const inMint = data.input_mint;
-  const outMint = data.output_mint;
-  const inputSol = data.input_amount;
-
-  console.log(
-    `✅ Signal Validated: BUY ${inputSol.toFixed(4)} SOL for ${data.output_symbol || outMint.slice(0, 4)}...`
-  );
-
-  for (let attempt = 0; attempt < slippageBpsAttempts.length; attempt++) {
-    const slippageBps = slippageBpsAttempts[attempt];
-    try {
-      console.log('--- [ATTEMPT ' + (attempt + 1) + '/' + slippageBpsAttempts.length + '] ---');
-      console.log(`💰 Executing BUY for ${inputSol.toFixed(4)} SOL with ${(slippageBps / 100).toFixed(0)}% slippage.`);
-
-      // 1) Get a quote
-      console.log('[Swap] Getting quote from Jupiter...');
-      const quoteReq: QuoteGetRequest = {
-        inputMint: inMint,
-        outputMint: outMint,
-        amount: Math.round(inputSol * LAMPORTS_PER_SOL), // amount in lamports when input is SOL
-        slippageBps,
-        platformFeeBps: 0,
-        onlyDirectRoutes: false,
-        asLegacyTransaction: false, // we are using v0
-        maxAccounts: 58, // leave headroom for tip + budget ixs
-      };
-
-      const quote = await jupiterApi.quoteGet(quoteReq);
-
-      // 2) Build swap instructions (we will append CU + tip around them)
-      console.log('[Swap] Building transaction for Helius Sender...');
-      const {
-        setupInstructions: sui,
-        swapInstruction: si,
-        cleanupInstruction: cui,
-        addressLookupTableAddresses, // prefer these over quote.lookupTableAccountAddresses
-      } = await jupiterApi.swapInstructionsPost({
-        swapRequest: {
-          quoteResponse: quote,
-          userPublicKey: walletKeypair.publicKey.toBase58(),
-          wrapAndUnwrapSol: true,
-        },
-      });
-
-      const setupIxs = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
-      const swapIx = rehydrateInstruction(si) as TransactionInstruction;
-      const cleanupIx = cui ? (rehydrateInstruction(cui) as TransactionInstruction) : null;
-
-      // 3) Jito tip
-      const tipAmountSOL = await getDynamicTipAmount();
-      console.log(`[Tip] Using dynamic Jito tip: ${tipAmountSOL} SOL`);
-      const tipIx = SystemProgram.transfer({
-        fromPubkey: walletKeypair.publicKey,
-        toPubkey: new PublicKey(
-          JITO_TIP_LIST[Math.floor(Math.random() * Math.max(1, JITO_TIP_LIST.length))]
-        ),
-        lamports: Math.round(tipAmountSOL * LAMPORTS_PER_SOL),
-      });
-
-      // 4) Compile a provisional v0 message to simulate and estimate compute usage/priority fee
-      const altAddresses =
-        (addressLookupTableAddresses?.length
-          ? addressLookupTableAddresses
-          : (quote as any)?.lookupTableAccountAddresses) ?? [];
-
-      const altAccounts = await loadLookupTableAccounts(altAddresses);
-
-      // Provisional CU limit (will recompile after sim if needed)
-      const provisionalIxs: TransactionInstruction[] = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }),
-        // price placeholder, replaced after estimate
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1 }),
-        ...setupIxs,
-        swapIx,
-        ...(cleanupIx ? [cleanupIx] : []),
-        tipIx,
-      ];
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      const provisionalMsg = new TransactionMessage({
-        payerKey: walletKeypair.publicKey,
-        recentBlockhash: blockhash,
-        instructions: provisionalIxs,
-      }).compileToV0Message(altAccounts);
-
-      const provisionalTx = new VersionedTransaction(provisionalMsg);
-
-      // Serialize for Helius priority fee estimation
-      const provisionalSerialized = Buffer.from(provisionalTx.serialize()).toString('base64');
-
-      // 5) Ask Helius for priority fee estimate (microLamports-per-CU)
-      let microLamports = await getPriorityFeeEstimateMicroLamports(provisionalSerialized);
-      if (!microLamports || microLamports <= 0) {
-        // fallback if estimation fails
-        microLamports = 500_000; // 0.5 lamports per CU; tune for your strategy
-      }
-      console.log(`[Priority Fee] Using dynamic fee: ${microLamports} microLamports`);
-
-      // 6) Simulate to get compute units used and adjust CU limit
-      const simResult = await connection.simulateTransaction(provisionalTx, {
-        commitment: 'processed',
-        replaceRecentBlockhash: true,
-        sigVerify: false,
-      });
-
-      if (simResult.value.err) {
-        console.error('Sim logs:\n' + (simResult.value.logs ?? []).join('\n'));
+    if (simResult.value.err || !simResult.value.unitsConsumed) {
         throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
-      }
-
-      const unitsConsumed = simResult.value.unitsConsumed ?? 350_000;
-      const cuLimit = Math.ceil(unitsConsumed * 1.2); // +20% headroom
-
-      // 7) Rebuild final instructions with accurate CU price and limit
-      const finalIxs: TransactionInstruction[] = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports }),
-        ...setupIxs,
-        swapIx,
-        ...(cleanupIx ? [cleanupIx] : []),
-        tipIx,
-      ];
-
-      const { blockhash: finalBlockhash } = await connection.getLatestBlockhash();
-      const finalMsg = new TransactionMessage({
-        payerKey: walletKeypair.publicKey,
-        recentBlockhash: finalBlockhash,
-        instructions: finalIxs,
-      }).compileToV0Message(altAccounts);
-
-      const finalTx = new VersionedTransaction(finalMsg);
-      finalTx.sign([walletKeypair]);
-
-      // Optionally, simulate again to be extra safe
-      const finalSim = await connection.simulateTransaction(finalTx, {
-        commitment: 'processed',
-        replaceRecentBlockhash: true,
-        sigVerify: true,
-      });
-
-      if (finalSim.value.err) {
-        console.error('Final sim logs:\n' + (finalSim.value.logs ?? []).join('\n'));
-        throw new Error(`Transaction simulation failed: ${JSON.stringify(finalSim.value.err)}`);
-      }
-
-      // 8) Send the tx
-      const raw = finalTx.serialize();
-      const sig = await connection.sendRawTransaction(raw, {
-        skipPreflight: true, // we already simulated
-        maxRetries: 3,
-      });
-
-      console.log('✅ Sent tx:', sig);
-
-      // 9) Confirm
-      const conf = await connection.confirmTransaction(
-        { signature: sig, blockhash: finalBlockhash, lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight },
-        'confirmed'
-      );
-
-      if (conf.value.err) {
-        throw new Error(`Confirmation error: ${JSON.stringify(conf.value.err)}`);
-      }
-
-      console.log(`🎉 Trade executed successfully for Signal ID: ${signalId}`);
-      await logTradeToFirestore({
-        txid: sig,
-        status: 'success',
-        date: new Date(),
-        signal_id: signalId,
-        in_mint: inMint,
-        out_mint: outMint,
-        amount_sol: inputSol,
-        slippage_bps: slippageBps,
-        priority_fee_micro_lamports: microLamports,
-        cu_limit: cuLimit,
-      });
-      console.log(`================== [SIGNAL ${signalId} END] ======================`);
-      return;
-    } catch (err: any) {
-      console.error(`❌ [TRADE FAILED] Attempt ${attempt + 1} failed: ${err.message}`);
-      if (attempt === slippageBpsAttempts.length - 1) {
-        console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
-        await logTradeToFirestore({
-          txid: null,
-          status: 'failed',
-          date: new Date(),
-          signal_id: signalId,
-          error: err?.message || 'Unknown error',
-        });
-        console.log(`================== [SIGNAL ${signalId} END] ======================`);
-        throw err;
-      }
     }
-  }
+    const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
+    console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
+
+    const finalInstructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+        ...instructionsForFeeAndCU,
+    ];
+
+    const messageV0 = new TransactionMessage({
+        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: finalInstructions,
+    }).compileToV0Message(addressLookupTableAccounts);
+    
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([walletKeypair]);
+    const rawTransaction = Buffer.from(transaction.serialize()).toString('base64');
+    
+    const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
+    if (!apiKey) throw new Error("Could not extract API key from SOLANA_RPC_ENDPOINT");
+    
+    const senderUrl = `http://ewr-sender.helius-rpc.com/fast?api-key=${apiKey}`;
+
+    console.log(`[Swap] Sending transaction via Helius Sender...`);
+    const response = await fetch(senderUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            jsonrpc: '2.0', id: '1', method: 'sendTransaction',
+            params: [ rawTransaction, { encoding: "base64", skipPreflight: true, maxRetries: 0 } ],
+        }),
+    });
+    
+    const json = await response.json() as { result: string, error?: any };
+    console.log('[Swap] Full Helius Sender Response:', JSON.stringify(json, null, 2));
+
+    if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
+    if (!json.result) throw new Error('Helius Sender response did not include a "result" (signature).');
+    
+    const txid = json.result;
+    const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
+    if (confirmation.value.err) throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+
+    console.log(`✅ Swap successful! Transaction: https://solscan.io/tx/${txid}`);
+    return { txid, quote };
 }
 
-/**
- * =======================
- * Example runner (optional)
- * =======================
- * Uncomment to quick-test locally:
- *
- * executeTradeFromSignal({
- *   signal_id: 98769,
- *   transaction_type: 'swap',
- *   input_mint: 'So11111111111111111111111111111111111111112',
- *   output_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
- *   input_amount: 0.01,
- *   output_symbol: 'USDC',
- * }).catch(() => process.exit(1));
- */
+export async function executeTrade(
+  tokenAddress: string, action: 'BUY' | 'SELL', solAmount: number, signalId: number
+): Promise<void> {
+    const slippageSettings = [500, 1500, 2500];
+    for (let i = 0; i < slippageSettings.length; i++) {
+        const currentSlippage = slippageSettings[i];
+        try {
+            console.log(`\n--- [ATTEMPT ${i + 1}/${slippageSettings.length}] ---`);
+            if (action === 'BUY') {
+                console.log(`💰 Executing BUY for ${solAmount.toFixed(4)} SOL with ${currentSlippage / 100}% slippage.`);
+                const outputTokenDecimals = await getTokenDecimals(tokenAddress);
+                const amountInLamports = Math.round(solAmount * 10 ** 9);
+                const { txid, quote } = await performSwap(SOL_MINT_ADDRESS, tokenAddress, amountInLamports, currentSlippage);
+                const tokenAmountReceived = Number(quote.outAmount) / 10 ** outputTokenDecimals;
+                
+                console.log(`📝 Logging BUY trade to database...`);
+                await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount, tokenAmount: tokenAmountReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
+                await managePosition({ signal_id: signalId, status: 'open', tokenAddress, solSpent: solAmount, tokenReceived: tokenAmountReceived, openedAt: new Date() });
+                console.log(`🎉 Successfully opened position for Signal ID: ${signalId}`);
+            } else {
+                console.log(`🔍 Checking for open position for Signal ID: ${signalId}...`);
+                const position = await getOpenPositionBySignalId(signalId);
+                if (!position) {
+                    console.log(`🟡 No open position found for Signal ID ${signalId}. Ignoring SELL signal.`);
+                    console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                    return;
+                }
+                console.log(`✅ Position found. Preparing to sell ${position.tokenReceived.toFixed(2)} tokens.`);
+                console.log(`💰 Executing SELL with ${currentSlippage / 100}% slippage.`);
+
+                const tokenDecimals = await getTokenDecimals(position.tokenAddress);
+                const amountToSellInSmallestUnit = Math.floor(position.tokenReceived * (10 ** tokenDecimals));
+                const { txid, quote } = await performSwap(position.tokenAddress, SOL_MINT_ADDRESS, amountToSellInSmallestUnit, currentSlippage);
+                const solReceived = Number(quote.outAmount) / 10 ** 9;
+                
+                console.log(`📝 Logging SELL trade to database...`);
+                await logTradeToFirestore({ txid, status: 'Success', kind: action, solAmount: solReceived, tokenAmount: position.tokenReceived, tokenAddress, slippageBps: currentSlippage, date: new Date(), signal_id: signalId });
+                await closePosition(String(signalId), txid, solReceived);
+                console.log(`🎉 Successfully closed position for Signal ID: ${signalId}`);
+            }
+            console.log(`================== [SIGNAL ${signalId} END] ======================`);
+            return;
+        } catch (error: any) {
+            console.error(`❌ [TRADE FAILED] Attempt ${i + 1} failed:`, error.message);
+            if (i === slippageSettings.length - 1) {
+                console.error(`🛑 [FATAL] All attempts failed for Signal ID ${signalId}.`);
+                await logTradeToFirestore({ txid: null, status: 'Failed', kind: action, solAmount: action === 'BUY' ? solAmount : 0, tokenAddress, reason: error.message || 'Unknown error', date: new Date(), signal_id: signalId });
+                console.log(`================== [SIGNAL ${signalId} END] ======================`);
+                throw error;
+            }
+        }
+    }
+}
