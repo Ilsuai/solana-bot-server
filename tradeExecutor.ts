@@ -21,13 +21,21 @@ import fetch from 'node-fetch';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
+// --- FIX IS HERE ---
+// Using the EXACT, VALIDATED list of wallets from the most recent error log.
 const JITO_TIP_ACCOUNTS = [
-  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF", "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or", "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
-  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT", "D2L6yP_Z2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
-  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
-  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+  "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+  "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+  "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
 ].map(a => new PublicKey(a));
+// --- END OF FIX ---
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
   throw new Error('Missing environment variables.');
@@ -37,22 +45,20 @@ const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY)
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const jupiterApi = createJupiterApiClient();
 
-// --- HELPER FUNCTIONS FOR DYNAMIC FEES ---
-
 async function getDynamicTipAmount(): Promise<number> {
   try {
     const response = await fetch('https://bundles.jito.wtf/api/v1/bundles/tip_floor');
     const data = await response.json() as any;
     if (data && data[0] && typeof data[0].landed_tips_75th_percentile === 'number') {
       const tip75th = data[0].landed_tips_75th_percentile;
-      const dynamicTip = Math.max(tip75th, 0.001); // Use 75th percentile but enforce minimum 0.001 SOL
+      const dynamicTip = Math.max(tip75th, 0.001);
       console.log(`[Tip] Using dynamic Jito tip: ${dynamicTip} SOL`);
       return dynamicTip;
     }
   } catch (error) {
     console.warn('[Tip] Failed to fetch dynamic tip amount, using fallback.', error);
   }
-  return 0.001; // Fallback to minimum
+  return 0.001;
 }
 
 async function getPriorityFee(instructions: TransactionInstruction[]): Promise<number> {
@@ -76,7 +82,7 @@ async function getPriorityFee(instructions: TransactionInstruction[]): Promise<n
     return fee;
   } catch (error) {
     console.warn("[Priority Fee] Failed to get dynamic fee, using fallback.", error);
-    return 500000; // Fallback fee
+    return 500000;
   }
 }
 
@@ -119,8 +125,6 @@ async function performSwap(
     const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
     const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
     const cleanupInstruction = rehydrateInstruction(cui);
-
-    // --- FULLY DYNAMIC FEE & COMPUTE UNIT LOGIC ---
     
     const tipAmountSOL = await getDynamicTipAmount();
     const tipInstruction = SystemProgram.transfer({
