@@ -30,8 +30,8 @@ const port = process.env.PORT || 3001;
 app.use(express.json());
 
 app.post('/nexagent-signal', async (req: Request, res: Response) => {
-    const signalId = req.body.data?.signal_id || 'Unknown';
-    console.log(`\n================== [SIGNAL ${signalId} RECEIVED] ==================`);
+    const signalId = req.body.data?.signal_id;
+    console.log(`\n================== [SIGNAL ${signalId || 'Unknown'} RECEIVED] ==================`);
     console.log(`Full Payload:`, JSON.stringify(req.body, null, 2));
 
     try {
@@ -51,24 +51,37 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
         }
 
         const tokenAddress = action === 'BUY' ? payloadData.output_mint : payloadData.input_mint;
-        const solAmount = action === 'BUY' ? payloadData.input_amount : payloadData.output_amount;
         
-        if (!action || !tokenAddress || !solAmount || solAmount <= 0 || !signalId) {
-            console.log(`❌ Validation Failed: Incomplete parameters.`);
-            return res.status(400).send('Failed to extract necessary trade parameters from signal.');
+        // --- FIX IS HERE ---
+        let solAmountForBuy: number | undefined;
+        if (action === 'BUY') {
+            solAmountForBuy = payloadData.input_amount;
         }
 
-        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
-        console.log(`✅ Signal Validated: ${action} ${solAmount.toFixed(4)} SOL for ${tokenSymbol} (${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)})`);
+        // Updated validation logic
+        if (!action || !tokenAddress || !signalId) {
+             console.log(`❌ Validation Failed: Missing action, tokenAddress, or signalId.`);
+             return res.status(400).send('Failed to extract necessary trade parameters from signal.');
+        }
+        if (action === 'BUY' && (!solAmountForBuy || solAmountForBuy <= 0)) {
+            console.log(`❌ Validation Failed: Invalid input_amount for BUY signal.`);
+            return res.status(400).send('Invalid input_amount for BUY signal.');
+        }
+        // --- END OF FIX ---
 
-        executeTrade(tokenAddress, action, solAmount, signalId).catch(error => {
+        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
+        // For a BUY, use the real amount. For a SELL, the amount is not used by the executor, so we pass 0.
+        const amountForExecutor = solAmountForBuy || 0; 
+        console.log(`✅ Signal Validated: ${action} ${tokenSymbol || 'token'} (${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)})`);
+
+        executeTrade(tokenAddress, action, amountForExecutor, signalId).catch(error => {
             console.error(`CRITICAL ASYNC ERROR for Signal ${signalId}:`, error.message);
         });
 
         res.status(200).send('Webhook received and trade initiated.');
 
     } catch (error) {
-        console.error(`A critical error occurred in the webhook handler for Signal ${signalId}:`, error);
+        console.error(`A critical error occurred in the webhook handler for Signal ${signalId || 'Unknown'}:`, error);
         res.status(500).send('Internal server error.');
     }
 });
