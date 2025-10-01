@@ -55,14 +55,21 @@ async function performSwap(
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
     
-    // --- FINAL, CORRECTED FIX ---
+    // @ts-ignore - The type might be missing this, but the API returns it.
+    const addressLookupTableKeys = quote.lookupTableAccountAddresses;
+    
+    // --- FIX IS HERE ---
 
-    // Get instructions from Jupiter API
-    const instructionsResponse = await jupiterApi.swapInstructionsPost({
+    // Destructure the API response into aliased variables
+    const { 
+      computeBudgetInstructions: cbi, 
+      setupInstructions: sui, 
+      swapInstruction: si, 
+      cleanupInstruction: cui, 
+    } = await jupiterApi.swapInstructionsPost({
         swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
-
-    // Helper function to safely convert string pubkeys to PublicKey objects
+    
     const rehydrateInstruction = (instruction: any) => {
       if (!instruction) return null;
       return new TransactionInstruction({
@@ -75,15 +82,12 @@ async function performSwap(
       });
     };
 
-    // Explicitly and safely handle all instructions, defaulting to empty arrays if undefined
-    const computeBudgetInstructions = (instructionsResponse.computeBudgetInstructions || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
-    const setupInstructions = (instructionsResponse.setupInstructions || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
-    const swapInstruction = rehydrateInstruction(instructionsResponse.swapInstruction) as TransactionInstruction;
-    const cleanupInstruction = rehydrateInstruction(instructionsResponse.cleanupInstruction);
-    
-    // @ts-ignore - The type might be missing this, but the API returns it.
-    const addressLookupTableKeys = quote.lookupTableAccountAddresses;
-    
+    // Use the correct aliased variables (cbi, sui, si, cui)
+    const computeBudgetInstructions = (cbi || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
+    const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
+    const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
+    const cleanupInstruction = rehydrateInstruction(cui);
+
     // --- END OF FIX ---
 
     const instructions = [
@@ -129,7 +133,8 @@ async function performSwap(
     if (!apiKey) {
       throw new Error("Could not extract API key from SOLANA_RPC_ENDPOINT");
     }
-    const senderUrl = `https://sender.helius-rpc.com/?api-key=${apiKey}`;
+    
+    const senderUrl = `http://ewr-sender.helius-rpc.com/fast?api-key=${apiKey}`;
 
     console.log(`[Swap] Sending transaction via Helius Sender...`);
     const response = await fetch(senderUrl, {
