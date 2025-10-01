@@ -13,8 +13,23 @@ import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePo
 import bs58 from 'bs58';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
-// Using a stable, official Jito tip address from the QuickNode documentation.
-const JITO_TIP_ACCOUNT = "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo";
+
+// The official list of Jito tip accounts from the QuickNode documentation
+const JITO_TIP_ACCOUNTS = [
+  "96g5iTWjRjc9vfjEc2MUDwbnBbya2Qk3rCByrAUmsL4T",
+  "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo",
+  "Cw8CFyM9FkoMi7K7crf6HNQqf4uEMzpKw6QNghXLvLkY",
+  "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwVMTU",
+  "DttWaMuVvTidu2V1Mj1pkasA1vrvWft9wBqEYiGXNpt8",
+  "3AVi9Tg9Uo68tJfuvoSSv7aGaia1P"
+];
+let tipAccountIndex = 0;
+
+function getJitoTipAccount(): string {
+  const selectedAccount = JITO_TIP_ACCOUNTS[tipAccountIndex];
+  tipAccountIndex = (tipAccountIndex + 1) % JITO_TIP_ACCOUNTS.length;
+  return selectedAccount;
+}
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
   throw new Error('Missing environment variables: PRIVATE_KEY and SOLANA_RPC_ENDPOINT are required.');
@@ -43,6 +58,8 @@ async function performSwap(
   isPanicSell: boolean = false
 ): Promise<{ txid: string; quote: QuoteResponse }> {
   console.log(`[Swap] Getting quote from Jupiter for Fastlane...`);
+  const tipAccount = getJitoTipAccount();
+  console.log(`Using Jito tip account: ${tipAccount.slice(0,4)}...${tipAccount.slice(-4)}`);
 
   const quote = await jupiterApi.quoteGet({
     inputMint,
@@ -65,8 +82,8 @@ async function performSwap(
       wrapAndUnwrapSol: true,
       // @ts-ignore
       jitoTipping: {
-          account: JITO_TIP_ACCOUNT,
-          amount: 1_000_000
+          account: tipAccount,
+          amount: 1_000_000 
       }
     },
   });
@@ -101,7 +118,6 @@ async function performSwap(
   return { txid, quote };
 }
 
-// The 'executeTrade' function remains unchanged.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
