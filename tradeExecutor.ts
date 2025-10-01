@@ -22,16 +22,11 @@ import fetch from 'node-fetch';
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
 const JITO_TIP_ACCOUNTS = [
-  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
-  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
-  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
-  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
-  "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
-  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
-  "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
-  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
-  "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF", "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or", "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"
 ].map(a => new PublicKey(a));
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
@@ -42,22 +37,20 @@ const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY)
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const jupiterApi = createJupiterApiClient();
 
-// --- HELPER FUNCTIONS FOR DYNAMIC FEES ---
-
 async function getDynamicTipAmount(): Promise<number> {
   try {
     const response = await fetch('https://bundles.jito.wtf/api/v1/bundles/tip_floor');
     const data = await response.json() as any;
     if (data && data[0] && typeof data[0].landed_tips_75th_percentile === 'number') {
       const tip75th = data[0].landed_tips_75th_percentile;
-      const dynamicTip = Math.max(tip75th, 0.001); // Use 75th percentile but enforce minimum 0.001 SOL
+      const dynamicTip = Math.max(tip75th, 0.001);
       console.log(`[Tip] Using dynamic Jito tip: ${dynamicTip} SOL`);
       return dynamicTip;
     }
   } catch (error) {
     console.warn('[Tip] Failed to fetch dynamic tip amount, using fallback.', error);
   }
-  return 0.001; // Fallback to minimum
+  return 0.001;
 }
 
 async function getPriorityFee(instructions: TransactionInstruction[]): Promise<number> {
@@ -81,7 +74,7 @@ async function getPriorityFee(instructions: TransactionInstruction[]): Promise<n
     return fee;
   } catch (error) {
     console.warn("[Priority Fee] Failed to get dynamic fee, using fallback.", error);
-    return 500000; // Fallback fee
+    return 500000;
   }
 }
 
@@ -106,7 +99,7 @@ async function performSwap(
     console.log(`[Swap] Building transaction for Helius Sender...`);
     
     const { 
-      computeBudgetInstructions: cbi, setupInstructions: sui, swapInstruction: si, cleanupInstruction: cui,
+      setupInstructions: sui, swapInstruction: si, cleanupInstruction: cui,
     } = await jupiterApi.swapInstructionsPost({
         swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
@@ -120,7 +113,8 @@ async function performSwap(
       });
     };
 
-    const computeBudgetInstructions = (cbi || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
+    // --- FIX IS HERE ---
+    // We now IGNORE Jupiter's computeBudgetInstructions to prevent duplicates.
     const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
     const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
     const cleanupInstruction = rehydrateInstruction(cui);
@@ -133,7 +127,8 @@ async function performSwap(
     });
 
     const instructionsForFeeAndCU = [
-        ...computeBudgetInstructions, ...setupInstructions, swapInstruction,
+        ...setupInstructions, 
+        swapInstruction,
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         tipInstruction,
     ].filter((ix): ix is TransactionInstruction => !!ix);
@@ -156,11 +151,13 @@ async function performSwap(
     const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
     console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
 
+    // Build the final, non-duplicated instruction set
     const finalInstructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
         ...instructionsForFeeAndCU,
     ];
+    // --- END OF FIX ---
 
     // @ts-ignore
     const addressLookupTableKeys = quote.lookupTableAccountAddresses;
