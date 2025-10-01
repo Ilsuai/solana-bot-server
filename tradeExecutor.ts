@@ -16,10 +16,9 @@ import {
 import { getMint } from '@solana/spl-token';
 import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
-import fetch from 'node-fetch'; // We need this for the Helius Sender API
+import fetch from 'node-fetch';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
-// A stable, official Jito tip account from the Helius documentation.
 const JITO_TIP_ACCOUNT = new PublicKey("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo");
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
@@ -56,16 +55,44 @@ async function performSwap(
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
 
+    // --- FIX STARTS HERE ---
+    
+    // 1. Get addressLookupTableAccounts from the QUOTE response.
+    const addressLookupTableKeys = quote.addressLookupTableAccounts;
+    
+    // 2. Get instructions from Jupiter API as JSON, without addressLookupTableAccounts.
     // @ts-ignore
-    const { computeBudgetInstructions, setupInstructions, swapInstruction, cleanupInstruction, addressLookupTableAccounts: addressLookupTableKeys } = 
-      await jupiterApi.swapInstructionsPost({
+    const { 
+      computeBudgetInstructions: cbi, 
+      setupInstructions: sui, 
+      swapInstruction: si, 
+      cleanupInstruction: cui, 
+    } = await jupiterApi.swapInstructionsPost({
         swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
+    
+    // Helper function to convert string pubkeys to PublicKey objects
+    const rehydrateInstruction = (instruction: any) => new TransactionInstruction({
+      programId: new PublicKey(instruction.programId),
+      keys: instruction.keys.map((key: any) => ({
+        ...key,
+        pubkey: new PublicKey(key.pubkey),
+      })),
+      data: Buffer.from(instruction.data, 'base64'),
+    });
+
+    // Deserialize all instructions from Jupiter
+    const computeBudgetInstructions = cbi?.map(rehydrateInstruction) || [];
+    const setupInstructions = sui?.map(rehydrateInstruction) || [];
+    const swapInstruction = rehydrateInstruction(si);
+    const cleanupInstruction = cui ? rehydrateInstruction(cui) : null;
+    
+    // --- FIX ENDS HERE ---
 
     const instructions = [
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }), // High priority fee
-        ...(computeBudgetInstructions || []),
-        ...(setupInstructions || []),
+        ...computeBudgetInstructions,
+        ...setupInstructions,
         swapInstruction,
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         SystemProgram.transfer({
@@ -101,9 +128,6 @@ async function performSwap(
     transaction.sign([walletKeypair]);
     const rawTransaction = Buffer.from(transaction.serialize()).toString('base64');
 
-    // --- FIX STARTS HERE ---
-
-    // 1. Dynamically get API key from your RPC endpoint variable
     const apiKey = process.env.SOLANA_RPC_ENDPOINT!.split('api-key=')[1];
     if (!apiKey) {
       throw new Error("Could not extract API key from SOLANA_RPC_ENDPOINT");
@@ -118,7 +142,6 @@ async function performSwap(
             jsonrpc: '2.0',
             id: '1',
             method: 'sendTransaction',
-            // 2. Add the required configuration object to the params array
             params: [
               rawTransaction,
               {
@@ -130,8 +153,6 @@ async function performSwap(
         }),
     });
     
-    // --- FIX ENDS HERE ---
-
     const json = await response.json() as { result: string, error?: any };
     if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
     
