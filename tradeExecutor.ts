@@ -53,12 +53,12 @@ async function getDynamicTipAmount(): Promise<number> {
   return 0.001;
 }
 
-async function getPriorityFee(instructions: TransactionInstruction[]): Promise<number> {
+async function getPriorityFee(instructions: TransactionInstruction[], lookupTableAccounts: AddressLookupTableAccount[]): Promise<number> {
   try {
     const { blockhash } = await connection.getLatestBlockhash();
     const testTxMessage = new TransactionMessage({
       payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions,
-    }).compileToV0Message();
+    }).compileToV0Message(lookupTableAccounts);
     const testTx = new VersionedTransaction(testTxMessage);
 
     const response = await fetch(connection.rpcEndpoint, {
@@ -98,69 +98,16 @@ async function performSwap(
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
     
+    // 1. Get instructions and lookup table addresses from Jupiter
     const { 
       setupInstructions: sui, swapInstruction: si, cleanupInstruction: cui,
     } = await jupiterApi.swapInstructionsPost({
         swapRequest: { quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
-    
-    const rehydrateInstruction = (instruction: any) => {
-      if (!instruction) return null;
-      return new TransactionInstruction({
-        programId: new PublicKey(instruction.programId),
-        keys: (instruction.keys || []).map((key: any) => ({ ...key, pubkey: new PublicKey(key.pubkey) })),
-        data: Buffer.from(instruction.data, 'base64'),
-      });
-    };
-
-    // --- FIX IS HERE ---
-    // We now IGNORE Jupiter's computeBudgetInstructions to prevent duplicates.
-    const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
-    const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
-    const cleanupInstruction = rehydrateInstruction(cui);
-    
-    const tipAmountSOL = await getDynamicTipAmount();
-    const tipInstruction = SystemProgram.transfer({
-        fromPubkey: walletKeypair.publicKey,
-        toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
-        lamports: tipAmountSOL * LAMPORTS_PER_SOL,
-    });
-
-    const instructionsForFeeAndCU = [
-        ...setupInstructions, 
-        swapInstruction,
-        ...(cleanupInstruction ? [cleanupInstruction] : []),
-        tipInstruction,
-    ].filter((ix): ix is TransactionInstruction => !!ix);
-
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    const priorityFee = await getPriorityFee(instructionsForFeeAndCU);
-    
-    const testInstructionsForCU = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
-    ];
-    const testMessage = new TransactionMessage({
-        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
-    }).compileToV0Message();
-    const simResult = await connection.simulateTransaction(new VersionedTransaction(testMessage), { sigVerify: false });
-    if (simResult.value.err || !simResult.value.unitsConsumed) {
-        throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
-    }
-    const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
-    console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
-
-    // Build the final, non-duplicated instruction set
-    const finalInstructions = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...instructionsForFeeAndCU,
-    ];
-    // --- END OF FIX ---
-
     // @ts-ignore
     const addressLookupTableKeys = quote.lookupTableAccountAddresses;
+    
+    // 2. Prepare Address Lookup Table Accounts FIRST
     const addressLookupTableAccounts: AddressLookupTableAccount[] = [];
     if (addressLookupTableKeys && addressLookupTableKeys.length > 0) {
         const lookupTableAccountInfos = await connection.getMultipleAccountsInfo(
@@ -175,7 +122,61 @@ async function performSwap(
             }
         }
     }
+
+    const rehydrateInstruction = (instruction: any) => {
+      if (!instruction) return null;
+      return new TransactionInstruction({
+        programId: new PublicKey(instruction.programId),
+        keys: (instruction.keys || []).map((key: any) => ({ ...key, pubkey: new PublicKey(key.pubkey) })),
+        data: Buffer.from(instruction.data, 'base64'),
+      });
+    };
     
+    const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
+    const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
+    const cleanupInstruction = rehydrateInstruction(cui);
+    
+    // 3. Prepare core instructions (including tip)
+    const tipAmountSOL = await getDynamicTipAmount();
+    const tipInstruction = SystemProgram.transfer({
+        fromPubkey: walletKeypair.publicKey,
+        toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
+        lamports: tipAmountSOL * LAMPORTS_PER_SOL,
+    });
+
+    const instructionsForFeeAndCU = [
+        ...setupInstructions, swapInstruction,
+        ...(cleanupInstruction ? [cleanupInstruction] : []),
+        tipInstruction,
+    ].filter((ix): ix is TransactionInstruction => !!ix);
+
+    // 4. Get fees and simulate WITH lookup tables
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    const priorityFee = await getPriorityFee(instructionsForFeeAndCU, addressLookupTableAccounts);
+    
+    const testInstructionsForCU = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+        ...instructionsForFeeAndCU,
+    ];
+    const testMessage = new TransactionMessage({
+        payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: testInstructionsForCU,
+    }).compileToV0Message(addressLookupTableAccounts);
+    
+    const simResult = await connection.simulateTransaction(new VersionedTransaction(testMessage), { sigVerify: false });
+    if (simResult.value.err || !simResult.value.unitsConsumed) {
+        throw new Error(`Transaction simulation failed: ${JSON.stringify(simResult.value.err)}`);
+    }
+    const computeUnits = Math.ceil(simResult.value.unitsConsumed * 1.2);
+    console.log(`[Compute Units] Simulation successful. Using limit: ${computeUnits}`);
+
+    // 5. Build final transaction with all optimizations
+    const finalInstructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+        ...instructionsForFeeAndCU,
+    ];
+
     const messageV0 = new TransactionMessage({
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: finalInstructions,
     }).compileToV0Message(addressLookupTableAccounts);
