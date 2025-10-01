@@ -58,9 +58,6 @@ async function performSwap(
     // @ts-ignore - The type might be missing this, but the API returns it.
     const addressLookupTableKeys = quote.lookupTableAccountAddresses;
     
-    // --- FIX IS HERE ---
-
-    // Destructure the API response into aliased variables
     const { 
       computeBudgetInstructions: cbi, 
       setupInstructions: sui, 
@@ -82,16 +79,13 @@ async function performSwap(
       });
     };
 
-    // Use the correct aliased variables (cbi, sui, si, cui)
     const computeBudgetInstructions = (cbi || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
     const setupInstructions = (sui || []).map(rehydrateInstruction).filter(Boolean) as TransactionInstruction[];
     const swapInstruction = rehydrateInstruction(si) as TransactionInstruction;
     const cleanupInstruction = rehydrateInstruction(cui);
 
-    // --- END OF FIX ---
-
     const instructions = [
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }), // High priority fee
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }),
         ...computeBudgetInstructions,
         ...setupInstructions,
         swapInstruction,
@@ -99,7 +93,7 @@ async function performSwap(
         SystemProgram.transfer({
             fromPubkey: walletKeypair.publicKey,
             toPubkey: JITO_TIP_ACCOUNT,
-            lamports: 1_000_000, // 0.001 SOL Jito Tip
+            lamports: 1_000_000,
         }),
     ].filter((ix): ix is TransactionInstruction => !!ix);
     
@@ -156,7 +150,17 @@ async function performSwap(
     });
     
     const json = await response.json() as { result: string, error?: any };
-    if (json.error) throw new Error(`Helius Sender Error: ${json.error.message}`);
+
+    // --- FIX IS HERE ---
+    console.log('[Swap] Full Helius Sender Response:', JSON.stringify(json, null, 2));
+
+    if (json.error) {
+      throw new Error(`Helius Sender Error: ${json.error.message}`);
+    }
+    if (!json.result) {
+      throw new Error('Helius Sender response did not include a "result" (signature).');
+    }
+    // --- END OF FIX ---
     
     const txid = json.result;
     const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
