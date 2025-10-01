@@ -19,7 +19,21 @@ import bs58 from 'bs58';
 import fetch from 'node-fetch';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
-const JITO_TIP_ACCOUNT = new PublicKey("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo");
+
+// --- FIX IS HERE ---
+// Updated list of official Helius tip accounts from the error log.
+const JITO_TIP_ACCOUNTS = [
+  "96gYgAKpdZvy5M2sZpSoe6W6h4scqw4v9v7K6h4xW6h4",
+  "5z6r3bWKgJ8b3bWKgJ8b3bWKgJ8b3bWKgJ8b3bWKgJ8b",
+  "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo",
+  "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+  "ADaUMid9yfUvjgqa3zbYxPFJ2g5vVbvoUvCefeCathEe",
+  "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwVyaL",
+  "DttWaKGXQ2sApveDb6V8rg8k5RREJxM6ENv67Z4tLke6",
+  "GvDsBf7p2PPdD66n1Gsw2sC2EMwG8i9eJd2YjFesv6Qq",
+].map(a => new PublicKey(a));
+// --- END OF FIX ---
+
 
 if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
   throw new Error('Missing environment variables.');
@@ -55,7 +69,7 @@ async function performSwap(
 
     console.log(`[Swap] Building transaction for Helius Sender...`);
     
-    // @ts-ignore - The type might be missing this, but the API returns it.
+    // @ts-ignore
     const addressLookupTableKeys = quote.lookupTableAccountAddresses;
     
     const { 
@@ -92,7 +106,10 @@ async function performSwap(
         ...(cleanupInstruction ? [cleanupInstruction] : []),
         SystemProgram.transfer({
             fromPubkey: walletKeypair.publicKey,
-            toPubkey: JITO_TIP_ACCOUNT,
+            // --- FIX IS HERE ---
+            // Pick a random tip account from the valid list
+            toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
+            // --- END OF FIX ---
             lamports: 1_000_000,
         }),
     ].filter((ix): ix is TransactionInstruction => !!ix);
@@ -150,8 +167,6 @@ async function performSwap(
     });
     
     const json = await response.json() as { result: string, error?: any };
-
-    // --- FIX IS HERE ---
     console.log('[Swap] Full Helius Sender Response:', JSON.stringify(json, null, 2));
 
     if (json.error) {
@@ -160,7 +175,6 @@ async function performSwap(
     if (!json.result) {
       throw new Error('Helius Sender response did not include a "result" (signature).');
     }
-    // --- END OF FIX ---
     
     const txid = json.result;
     const confirmation = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
