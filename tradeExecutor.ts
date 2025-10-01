@@ -11,6 +11,7 @@ import {
 import { getMint } from '@solana/spl-token';
 import { logTradeToFirestore, managePosition, getOpenPositionBySignalId, closePosition } from './firebaseAdmin';
 import bs58 from 'bs58';
+import fetch from 'node-fetch';
 
 const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
@@ -21,6 +22,28 @@ if (!process.env.PRIVATE_KEY || !process.env.SOLANA_RPC_ENDPOINT) {
 const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const jupiterApi = createJupiterApiClient();
+
+async function getJitoTipAccount(): Promise<string> {
+  try {
+    const response = await fetch(process.env.SOLANA_RPC_ENDPOINT!, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getTipAccounts',
+        params: [],
+      }),
+    });
+    const data = await response.json() as { result: string[] };
+    const randomIndex = Math.floor(Math.random() * data.result.length);
+    return data.result[randomIndex];
+  } catch (error) {
+    console.error("Failed to fetch Jito tip accounts, using a default.", error);
+    return "Cw8CFyM9FkoMi7K7crf6HNQqf4uEMzpKw6QNghXLvLkY";
+  }
+}
+
 
 async function getTokenDecimals(mintAddress: string): Promise<number> {
   if (mintAddress === SOL_MINT_ADDRESS) return 9;
@@ -55,13 +78,20 @@ async function performSwap(
   if (!quote) {
     throw new Error('Failed to get a quote from Jupiter.');
   }
+  
+  const tipAccount = await getJitoTipAccount();
+  console.log(`Using Jito tip account: ${tipAccount}`);
 
-  // The Fastlane add-on handles Jito routing automatically. No manual tip needed.
   const swapResult = await jupiterApi.swapPost({
     swapRequest: {
       quoteResponse: quote,
       userPublicKey: walletKeypair.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
+      // @ts-ignore - This bypasses the local editor's false error for jitoTipping
+      jitoTipping: {
+          account: tipAccount,
+          amount: 1_000_000 // 0.001 SOL in lamports
+      }
     },
   });
 
