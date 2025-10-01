@@ -97,7 +97,7 @@ async function performSwap(
   return { txid, quote };
 }
 
-// The 'executeTrade' function remains unchanged.
+// The 'executeTrade' function remains unchanged from the previous version.
 export async function executeTrade(
   tokenAddress: string,
   action: 'BUY' | 'SELL',
