@@ -4,7 +4,7 @@ import {
   PublicKey,
   SystemProgram,
   TransactionInstruction,
-  Message,
+  TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
@@ -44,16 +44,16 @@ async function runSpeedTest() {
     })
   ];
   
-  // CORRECTED: Use Message.compile({ ... }) to build the message
-  const message = Message.compile({
+  // CORRECTED SYNTAX: Use TransactionMessage and compileToV0Message()
+  const message = new TransactionMessage({
     payerKey: wallet.publicKey,
-    instructions,
     recentBlockhash: blockhash,
-  });
-  const versionedTransaction = new VersionedTransaction(message);
+    instructions,
+  }).compileToV0Message();
+  const transaction = new VersionedTransaction(message);
 
-  versionedTransaction.sign([wallet]);
-  const rawTransaction = versionedTransaction.serialize();
+  transaction.sign([wallet]);
+  const rawTransaction = transaction.serialize();
 
   console.log('\nSending and confirming versioned transaction with Jito tip...');
   console.time('Transaction confirmed in');
