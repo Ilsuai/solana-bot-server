@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import { executeTrade } from './tradeExecutor';
 import { initializeFirebase } from './firebaseAdmin';
+import fetch from 'node-fetch';
 
 // --- Bot Startup Log ---
 console.log("==================================================");
@@ -21,7 +22,6 @@ if (rpcUrl) {
 console.log("--------------------------------------------------");
 // --- End of Startup Log ---
 
-// Initialize Firebase Admin SDK
 initializeFirebase();
 
 const app = express();
@@ -51,30 +51,17 @@ app.post('/nexagent-signal', async (req: Request, res: Response) => {
         }
 
         const tokenAddress = action === 'BUY' ? payloadData.output_mint : payloadData.input_mint;
-        
-        // --- FIX IS HERE ---
-        let solAmountForBuy: number | undefined;
-        if (action === 'BUY') {
-            solAmountForBuy = payloadData.input_amount;
-        }
+        const amountFromSignal = payloadData.input_amount;
+        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
 
-        // Updated validation logic
-        if (!action || !tokenAddress || !signalId) {
-             console.log(`❌ Validation Failed: Missing action, tokenAddress, or signalId.`);
+        if (!action || !tokenAddress || !signalId || !amountFromSignal || amountFromSignal <= 0) {
+             console.log(`❌ Validation Failed: Incomplete parameters (action, tokenAddress, signalId, or amount).`);
              return res.status(400).send('Failed to extract necessary trade parameters from signal.');
         }
-        if (action === 'BUY' && (!solAmountForBuy || solAmountForBuy <= 0)) {
-            console.log(`❌ Validation Failed: Invalid input_amount for BUY signal.`);
-            return res.status(400).send('Invalid input_amount for BUY signal.');
-        }
-        // --- END OF FIX ---
-
-        const tokenSymbol = action === 'BUY' ? payloadData.output_symbol : payloadData.input_symbol;
-        // For a BUY, use the real amount. For a SELL, the amount is not used by the executor, so we pass 0.
-        const amountForExecutor = solAmountForBuy || 0; 
+        
         console.log(`✅ Signal Validated: ${action} ${tokenSymbol || 'token'} (${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)})`);
 
-        executeTrade(tokenAddress, action, amountForExecutor, signalId).catch(error => {
+        executeTrade(tokenAddress, action, amountFromSignal, signalId, tokenSymbol).catch(error => {
             console.error(`CRITICAL ASYNC ERROR for Signal ${signalId}:`, error.message);
         });
 
@@ -92,4 +79,30 @@ app.get('/', (req, res) => {
 
 app.listen(port, () => {
     console.log(`✅ Server is running and listening on port ${port}`);
+
+    const apiKey = process.env.SOLANA_RPC_ENDPOINT?.split('api-key=')[1];
+    if (apiKey) {
+        const senderPingUrl = `http://ewr-sender.helius-rpc.com/ping?api-key=${apiKey}`;
+
+        const warmConnection = async () => {
+            try {
+                // @ts-ignore
+                const response = await fetch(senderPingUrl);
+                if (response.ok) {
+                    console.log(`[Warmup] Ping successful. Connection is warm.`);
+                } else {
+                    console.warn(`[Warmup] Ping failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                console.error('[Warmup] Ping failed with error:', (error as Error).message);
+            }
+        };
+
+        warmConnection();
+        
+        // --- UPDATED PING INTERVAL ---
+        setInterval(warmConnection, 50000); // 50,000 milliseconds = 50 seconds
+    } else {
+        console.warn('[Warmup] Could not start connection warmer: API key not found in SOLANA_RPC_ENDPOINT.');
+    }
 });
