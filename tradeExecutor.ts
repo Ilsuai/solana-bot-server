@@ -256,7 +256,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       } else {
         amountInSmallestUnit = requestedAmountLamports;
       }
-      console.log(`🟢 Executing BUY for ${(Number(amountInSmallestUnit) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> ${symbol || 'Token'}`);
+      console.log(`🟢 >> BUY << Executing BUY 🟢 for ${(Number(amountInSmallestUnit) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> ${symbol || 'Token'}`);
 
     } else { // SELL (Trust the Wallet logic remains)
       const balance = await getWalletTokenBalance(input_mint);
@@ -264,7 +264,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
 
       amountInSmallestUnit = (balance * 9999n) / 10000n; // Sell 99.99% to leave dust
       const amountToSellFloat = Number(amountInSmallestUnit) / (10 ** tokenDecimals);
-      console.log(`🔴 Executing SELL of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'} (raw: ${amountInSmallestUnit})`);
+      console.log(`🔴 >> SELL << Executing SELL 🔴 of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'} (raw: ${amountInSmallestUnit})`);
     }
 
     // Step 3: Fresh Quoting (Staleness Guard & Dynamic Slippage)
