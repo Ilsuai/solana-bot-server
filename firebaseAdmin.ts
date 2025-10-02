@@ -1,5 +1,8 @@
+// src/firebaseAdmin.ts
+
 import admin from 'firebase-admin';
 
+// The getFirestore function is imported from the top-level 'firebase-admin' package
 let db: admin.firestore.Firestore;
 
 export function initializeFirebase() {
@@ -23,10 +26,37 @@ export function initializeFirebase() {
   }
 }
 
+/**
+ * Fetches the bot's operational status from Firestore.
+ * @returns {Promise<'RUNNING' | 'PAUSED' | 'OFF'>} The current status of the bot.
+ */
+export async function getBotStatus(): Promise<'RUNNING' | 'PAUSED' | 'OFF'> {
+  if (!db) {
+    console.warn('[Firestore] DB not initialized, returning PAUSED status as a safeguard.');
+    return 'PAUSED';
+  }
+  try {
+    // CORRECT SYNTAX: Chain .collection() and .doc() from the db object
+    const settingsRef = db.collection('settings').doc('bot-settings');
+    const docSnap = await settingsRef.get(); // Use .get() on the reference
+
+    if (docSnap.exists && docSnap.data()?.botStatus === 'RUNNING') {
+      return 'RUNNING';
+    }
+    
+    // Default to PAUSED if not explicitly running or document doesn't exist
+    return 'PAUSED';
+  } catch (error) {
+    console.error('[Firestore] Error fetching bot status, defaulting to PAUSED:', error);
+    return 'PAUSED';
+  }
+}
+
 export async function logTradeToFirestore(tradeData: any) {
   if (!db) return;
   try {
-    await db.collection('trades').add(tradeData);
+    const dataWithTimestamp = { ...tradeData, timestamp: new Date() };
+    await db.collection('trades').add(dataWithTimestamp);
   } catch (error) {
     console.error('Failed to log trade:', error);
   }
@@ -35,7 +65,6 @@ export async function logTradeToFirestore(tradeData: any) {
 export async function managePosition(positionData: any) {
   if (!db) return;
   try {
-    // Use signal_id as the document ID for easy lookup
     await db.collection('positions').doc(String(positionData.signal_id)).set(positionData, { merge: true });
   } catch (error) {
     console.error('Failed to manage position:', error);

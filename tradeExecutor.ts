@@ -1,12 +1,14 @@
+// src/tradeExecutor.ts
+
 import {
   AddressLookupTableAccount, ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL,
   PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction,
 } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getMint, getAccount, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
-import { createJupiterApiClient } from '@jup-ag/api';
+import { createJupiterApiClient, QuoteResponse } from '@jup-ag/api';
 import bs58 from 'bs58';
 import fetch from 'node-fetch';
-import { logTradeToFirestore } from './firebaseAdmin';
+import { logTradeToFirestore, getBotStatus } from './firebaseAdmin';
 
 // --- CONFIG ---
 if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
@@ -15,7 +17,17 @@ if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
 const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT, 'confirmed');
 const walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
 const jupiterApi = createJupiterApiClient();
+
+// Jito Tips
 const JITO_TIP_ACCOUNTS = (process.env.JITO_TIP_ACCOUNTS || "96gYgAKpdZvy5M2sZpSoe6W6h4scqw4v9v7K6h4xW6h4,HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucL4bge9fgo,D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ").split(',').map(k => new PublicKey(k));
+const JITO_TIP_SOL = parseFloat(process.env.JITO_TIP_SOL || '0.001');
+
+// Trade Execution Config
+const SOL_SAFETY_BUFFER = parseFloat(process.env.SOL_SAFETY_BUFFER || '0.015'); // Keep this much SOL in wallet at all times
+const ATA_RENT_SOL = 0.00203928; // Rent for a new Associated Token Account
+const MAX_SLIPPAGE_BPS = parseInt(process.env.MAX_SLIPPAGE_BPS || '300', 10); // 3% default max slippage for dynamic slippage
+const QUOTE_STALENESS_THRESHOLD_MS = parseInt(process.env.QUOTE_STALENESS_THRESHOLD_MS || '2000', 10); // 2 seconds
+const MAX_QUOTE_RETRIES = 3;
 
 // --- TYPES ---
 export type TradeSignal = {
@@ -85,21 +97,6 @@ async function getPriorityFeeEstimate(transaction: VersionedTransaction): Promis
     }
 }
 
-async function ensureSolBufferOrGetTip(minSol: number = 0.02): Promise<number> {
-  const balLamports = await connection.getBalance(walletKeypair.publicKey, 'processed');
-  const balSol = balLamports / LAMPORTS_PER_SOL;
-  console.log(`[Check] Current SOL Balance: ${balSol.toFixed(4)}`);
-
-  let tipSol = 0.001;
-  const estFeeSol = 0.0006; 
-  if (balSol < minSol + tipSol + estFeeSol) {
-    tipSol = Math.max(0.0003, Math.max(0, balSol - (minSol + estFeeSol)));
-    console.warn(`[SOL Buffer] Low SOL balance. Scaling tip down to ${tipSol} SOL.`);
-  }
-  if (tipSol <= 0) throw new Error(`Insufficient SOL for fees + tip. Balance: ${balSol.toFixed(4)}, Required minimum: ${minSol}`);
-  return tipSol;
-}
-
 const rehydrateInstruction = (instruction: any): TransactionInstruction | null => {
     if (!instruction) return null;
     return new TransactionInstruction({
@@ -111,39 +108,99 @@ const rehydrateInstruction = (instruction: any): TransactionInstruction | null =
     });
 };
 
+/**
+ * Fetches a quote from Jupiter, ensuring it's not stale and respecting retry limits.
+ */
+async function getValidQuote(inputMint: string, outputMint: string, amount: number): Promise<QuoteResponse> {
+  let retries = 0;
+  while (retries < MAX_QUOTE_RETRIES) {
+    try {
+      const quote = await jupiterApi.quoteGet({
+        inputMint,
+        outputMint,
+        amount,
+        // CORRECTED SYNTAX FOR DYNAMIC SLIPPAGE
+        dynamicSlippage: true,
+        slippageBps: MAX_SLIPPAGE_BPS,
+        asLegacyTransaction: false,
+      });
+
+      if (!quote) throw new Error("Jupiter returned a null quote.");
+
+      // CORRECTED HANDLING OF OPTIONAL timeTaken
+      const quoteAge = Date.now() - ((quote.timeTaken ?? 0) * 1000);
+      const isStale = quoteAge > QUOTE_STALENESS_THRESHOLD_MS;
+      const hasComplexRoute = (quote.routePlan?.length ?? 0) > 2;
+
+      if (!isStale && !hasComplexRoute) {
+        console.log(`[Jupiter] Quote received. Min out: ${Number(quote.outAmount) / (10 ** 9)}`);
+        return quote;
+      }
+
+      console.warn(`[Jupiter] Refetching quote. Reason: ${isStale ? 'Stale' : ''} ${hasComplexRoute ? 'Complex Route' : ''}`);
+
+    } catch (error) {
+      console.error(`[Jupiter] Attempt ${retries + 1} failed to get quote:`, (error as Error).message);
+    }
+    retries++;
+  }
+  throw new Error(`Failed to get a valid quote from Jupiter after ${MAX_QUOTE_RETRIES} retries.`);
+}
+
+
 // --- CORE TRADE LOGIC ---
 
 export async function executeTradeFromSignal(signal: TradeSignal) {
   const { action, signal_id, input_mint, output_mint, input_amount, symbol } = signal;
 
   try {
+    // 1. CHECK BOT STATUS FROM FIRESTORE
+    const botStatus = await getBotStatus();
+    if (botStatus !== 'RUNNING') {
+      throw new Error(`Bot status is '${botStatus}'. Skipping signal.`);
+    }
+    console.log(`✅ Bot is RUNNING. Proceeding with Signal ID: ${signal_id}`);
+
     const tokenAddress = action === 'BUY' ? output_mint : input_mint;
-    console.log(`✅ Signal Validated: ${action} ${symbol || tokenAddress.slice(0,4)}`);
-
-    const [tokenDecimals, tipAmountSOL] = await Promise.all([
-      getTokenDecimals(tokenAddress),
-      ensureSolBufferOrGetTip(),
-    ]);
-
+    const tokenDecimals = await getTokenDecimals(tokenAddress);
+    
     let amountInSmallestUnit: bigint;
+
     if (action === 'BUY') {
-      console.log(`🟢 Executing BUY for ${input_amount.toFixed(4)} SOL -> ${symbol || 'Token'}`);
-      amountInSmallestUnit = BigInt(Math.round(input_amount * LAMPORTS_PER_SOL));
+      // 2. PRE-TRADE SOLVENCY CHECK
+      const currentSolBalance = await connection.getBalance(walletKeypair.publicKey, 'confirmed');
+      const priorityFeeEstimateLamports = 500000; // conservative estimate for pre-check
+      const tipLamports = JITO_TIP_SOL * LAMPORTS_PER_SOL;
+      
+      const overheadLamports = BigInt(priorityFeeEstimateLamports + tipLamports) + BigInt(Math.ceil((SOL_SAFETY_BUFFER + ATA_RENT_SOL) * LAMPORTS_PER_SOL));
+      const spendableLamports = currentSolBalance - Number(overheadLamports);
+      
+      let lamportsToSpend = BigInt(Math.round(input_amount * LAMPORTS_PER_SOL));
+      
+      if (lamportsToSpend > spendableLamports) {
+        console.warn(`[Solvency] Insufficient balance for full buy. Requested: ${input_amount} SOL, Spendable: ${(spendableLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL. Downsizing trade.`);
+        lamportsToSpend = BigInt(spendableLamports);
+      }
+
+      if (lamportsToSpend <= 0) {
+        throw new Error(`Insufficient SOL for trade and fees. Balance: ${(currentSolBalance / LAMPORTS_PER_SOL).toFixed(4)}`);
+      }
+      
+      amountInSmallestUnit = lamportsToSpend;
+      const effectiveSolAmount = Number(amountInSmallestUnit) / LAMPORTS_PER_SOL;
+      console.log(`🟢 Executing BUY 🟢 for ${effectiveSolAmount.toFixed(4)} SOL -> ${symbol || 'Token'}`);
+
     } else { // SELL
       const balance = await getWalletTokenBalance(input_mint);
       if (balance === 0n) throw new Error(`No wallet balance for ${symbol} (${input_mint}). Skipping SELL.`);
       
-      amountInSmallestUnit = (balance * 9999n) / 10000n; // Sell 99.99% to leave dust
+      amountInSmallestUnit = (balance * 9999n) / 10000n; // Sell 99.99%
       const amountToSellFloat = Number(amountInSmallestUnit) / (10 ** tokenDecimals);
-      console.log(`🔴 Executing SELL of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'} (raw: ${amountInSmallestUnit})`);
+      console.log(`🔴 Executing SELL 🔴 of ~${amountToSellFloat.toFixed(4)} ${symbol || 'Token'}`);
     }
 
-    const quote = await jupiterApi.quoteGet({
-      inputMint: input_mint, outputMint: output_mint, amount: Number(amountInSmallestUnit),
-      slippageBps: 1500, asLegacyTransaction: false,
-    });
-    if (!quote) throw new Error("Failed to get quote from Jupiter.");
-    console.log(`[Jupiter] Quote received. Min out: ${Number(quote.outAmount) / (10 ** (action === 'BUY' ? tokenDecimals : 9))}`);
+    // 3. GET A VALID, NON-STALE QUOTE
+    const quote = await getValidQuote(input_mint, output_mint, Number(amountInSmallestUnit));
     
     const { 
       swapInstruction: si, setupInstructions: sui, cleanupInstruction: cui, addressLookupTableAddresses,
@@ -160,7 +217,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const tipInstruction = SystemProgram.transfer({
         fromPubkey: walletKeypair.publicKey,
         toPubkey: JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
-        lamports: Math.round(tipAmountSOL * LAMPORTS_PER_SOL),
+        lamports: Math.round(JITO_TIP_SOL * LAMPORTS_PER_SOL),
     });
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -169,9 +226,6 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
         if (!accountInfo) throw new Error(`Could not fetch ALT account info for ${address}`);
         return new AddressLookupTableAccount({ key: new PublicKey(address), state: AddressLookupTableAccount.deserialize(accountInfo.data) });
     }));
-    if (lookupTableAccounts.length > 0) {
-        console.log(`[Build] Found and loaded ${lookupTableAccounts.length} Address Lookup Tables.`);
-    }
     
     let tempMessage = new TransactionMessage({
         payerKey: walletKeypair.publicKey, recentBlockhash: blockhash, instructions: [...instructions, tipInstruction],
@@ -216,10 +270,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
               jsonrpc: '2.0', id: '1', method: 'sendTransaction',
-              params: [
-                  bs58.encode(finalTransaction.serialize()), 
-                  { encoding: "base58", skipPreflight: true, maxRetries: 0 } 
-              ],
+              params: [ bs58.encode(finalTransaction.serialize()), { encoding: "base58", skipPreflight: true, maxRetries: 0 } ],
           }),
       });
       const json = await response.json() as any;
@@ -236,14 +287,14 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const confResult = await connection.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
     if (confResult.value.err) throw new Error(`Confirmation failed: ${JSON.stringify(confResult.value.err)}`);
 
-    console.log(`✅ Swap successful! Tx: https://solscan.io/tx/${txid}`);
+    console.log(`✅ Swap successful! ✅ Tx: https://solscan.io/tx/${txid}`);
     
-    await logTradeToFirestore({ txid, signal_id, action, symbol });
+    await logTradeToFirestore({ txid, signal_id, action, symbol, status: 'Success' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
 
   } catch (error: any) {
     console.error(`🛑 [FATAL] Trade for Signal ID ${signal_id} failed:`, error.message);
-    await logTradeToFirestore({ txid: null, signal_id, action, symbol, error: error.message });
+    await logTradeToFirestore({ txid: null, signal_id, action, symbol, error: error.message, status: 'Failed' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
   }
 }
