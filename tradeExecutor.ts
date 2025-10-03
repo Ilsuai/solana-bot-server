@@ -410,14 +410,15 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const endTime = Date.now();
     console.log(`✅ Swap successful! Total time: ${endTime - startTime}ms. Tx: https://solscan.io/tx/${txid}`);
 
-        if (action === 'BUY') {
+     if (action === 'BUY') {
       await managePosition({
         signal_id: signal_id,
         status: 'open',
         openedAt: new Date(),
         tokenAddress: output_mint,
         tokenSymbol: symbol,
-        solSpent: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL,
+        // **FIX**: Changed 'solSpent' to 'solAmount' for consistency
+        solAmount: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL,
         tokenReceived: Number(quote.outAmount) / (10 ** tokenDecimals),
         txid: txid,
       });
@@ -430,8 +431,8 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
         exitTx: txid,
       });
     }
-
-    await logTradeToFirestore({ txid, signal_id, action, symbol, timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' });
+    
+    await logTradeToFirestore({ txid, signal_id, action, symbol, solAmount: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL, timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
 
   } catch (error: any) {
