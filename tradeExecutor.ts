@@ -209,6 +209,10 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
   const { action, signal_id, input_mint, output_mint, input_amount, symbol } = signal;
   const startTime = Date.now();
 
+    let txid: string | null = null;
+  let amountInSmallestUnit: bigint = 0n;
+  let quote: QuoteResponse | undefined = undefined;
+
   try {
     // Operational Safety Check
     const botStatus = await getBotStatus();
@@ -414,36 +418,47 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       ? Number(amountInSmallestUnit) / LAMPORTS_PER_SOL // For a BUY, it's the SOL we spent.
       : Number(quote.outAmount) / LAMPORTS_PER_SOL;      // For a SELL, it's the SOL we received from the quote.
 
-
-     if (action === 'BUY') {
+    if (action === 'BUY') {
       await managePosition({
-        signal_id: signal_id,
-        status: 'open',
-        openedAt: new Date(),
-        tokenAddress: output_mint,
-        tokenSymbol: symbol,
-        // **FIX**: Changed 'solSpent' to 'solAmount' for consistency
-        solAmount: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL,
+        signal_id: signal_id, status: 'open', openedAt: new Date(), tokenAddress: output_mint, tokenSymbol: symbol,
+        solAmount: solAmountForLog,
         tokenReceived: Number(quote.outAmount) / (10 ** tokenDecimals),
         txid: txid,
       });
     } else { // SELL
       await managePosition({
-        signal_id: signal_id,
-        status: 'closed',
-        closedAt: new Date(),
-        solReceived: Number(quote.outAmount) / LAMPORTS_PER_SOL,
+        signal_id: signal_id, status: 'closed', closedAt: new Date(),
+        solReceived: solAmountForLog,
         exitTx: txid,
       });
     }
     
-    await logTradeToFirestore({ txid, signal_id, action, symbol, solAmount: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL, timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' });
+    await logTradeToFirestore({ 
+      txid, signal_id, action, symbol, 
+      solAmount: solAmountForLog, // Use the corrected variable
+      timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' 
+    });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
 
   } catch (error: any) {
     const endTime = Date.now();
     console.error(`🛑 [FATAL] Trade for Signal ID ${signal_id} failed in ${endTime - startTime}ms:`, error.message);
-    await logTradeToFirestore({ txid: null, signal_id, action, symbol, error: error.message, timestamp: new Date(), durationMs: endTime - startTime, status: 'Failed' });
+    
+       const solAmountForLog = (action === 'BUY' && amountInSmallestUnit > 0n) 
+      ? Number(amountInSmallestUnit) / LAMPORTS_PER_SOL 
+      : null;
+
+    await logTradeToFirestore({ 
+      txid: txid, // Use explicit property assignment, not shorthand
+      signal_id: signal_id, 
+      action: action, 
+      symbol: symbol,
+      solAmount: solAmountForLog,
+      error: error.message, 
+      timestamp: new Date(), 
+      durationMs: endTime - startTime, 
+      status: 'Failed' 
+    });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
   }
 }
