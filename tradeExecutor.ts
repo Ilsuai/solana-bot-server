@@ -410,6 +410,11 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const endTime = Date.now();
     console.log(`✅ Swap successful! Total time: ${endTime - startTime}ms. Tx: https://solscan.io/tx/${txid}`);
 
+     const solAmountForLog = action === 'BUY'
+      ? Number(amountInSmallestUnit) / LAMPORTS_PER_SOL // For a BUY, it's the SOL we spent.
+      : Number(quote.outAmount) / LAMPORTS_PER_SOL;      // For a SELL, it's the SOL we received from the quote.
+
+
      if (action === 'BUY') {
       await managePosition({
         signal_id: signal_id,
