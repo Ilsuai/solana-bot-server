@@ -410,13 +410,13 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const endTime = Date.now();
     console.log(`✅ Swap successful! Total time: ${endTime - startTime}ms. Tx: https://solscan.io/tx/${txid}`);
 
-    await logTradeToFirestore({ txid, signal_id, action, symbol, timestamp: new Date(), durationMs: endTime - startTime, status: 'success' });
+    await logTradeToFirestore({ txid, signal_id, action, symbol, timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
 
   } catch (error: any) {
     const endTime = Date.now();
     console.error(`🛑 [FATAL] Trade for Signal ID ${signal_id} failed in ${endTime - startTime}ms:`, error.message);
-    await logTradeToFirestore({ txid: null, signal_id, action, symbol, error: error.message, timestamp: new Date(), durationMs: endTime - startTime, status: 'failed' });
+    await logTradeToFirestore({ txid: null, signal_id, action, symbol, error: error.message, timestamp: new Date(), durationMs: endTime - startTime, status: 'Failed' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
   }
 }
