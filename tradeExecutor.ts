@@ -7,7 +7,7 @@ import { createJupiterApiClient, QuoteResponse } from '@jup-ag/api';
 import bs58 from 'bs58';
 // @ts-ignore
 import fetch from 'node-fetch';
-import { logTradeToFirestore, getBotStatus } from './firebaseAdmin';
+import { logTradeToFirestore, getBotStatus, managePosition } from './firebaseAdmin';
 
 // --- CONFIGURATION & CONSTANTS ---
 if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
@@ -409,6 +409,27 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
 
     const endTime = Date.now();
     console.log(`✅ Swap successful! Total time: ${endTime - startTime}ms. Tx: https://solscan.io/tx/${txid}`);
+
+        if (action === 'BUY') {
+      await managePosition({
+        signal_id: signal_id,
+        status: 'open',
+        openedAt: new Date(),
+        tokenAddress: output_mint,
+        tokenSymbol: symbol,
+        solSpent: Number(amountInSmallestUnit) / LAMPORTS_PER_SOL,
+        tokenReceived: Number(quote.outAmount) / (10 ** tokenDecimals),
+        txid: txid,
+      });
+    } else { // SELL
+      await managePosition({
+        signal_id: signal_id,
+        status: 'closed',
+        closedAt: new Date(),
+        solReceived: Number(quote.outAmount) / LAMPORTS_PER_SOL,
+        exitTx: txid,
+      });
+    }
 
     await logTradeToFirestore({ txid, signal_id, action, symbol, timestamp: new Date(), durationMs: endTime - startTime, status: 'Success' });
     console.log(`================== [SIGNAL ${signal_id} END] ======================`);
