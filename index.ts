@@ -30,8 +30,8 @@ const port = process.env.PORT || 3001;
 
 app.use(express.json());
 
-// THIS IS THE LINE TO CHANGE
-app.post('/YOUR_NEW_WEBHOOK_URL_HERE', async (req: Request, res: Response) => {
+// This is your live webhook endpoint
+app.post('/nexagent-signal', async (req: Request, res: Response) => {
     const signalId = req.body.data?.signal_id;
     console.log(`\n================== [SIGNAL ${signalId || 'Unknown'} RECEIVED] ==================`);
     console.log(`Full Payload:`, JSON.stringify(req.body, null, 2));

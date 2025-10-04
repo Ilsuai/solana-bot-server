@@ -13,7 +13,7 @@ export function initializeFirebase() {
   try {
     const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
-      : require('../service-account-key.json'); // This is the only line that changed
+      : require('../service-account-key.json'); // This is the corrected line
 
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
