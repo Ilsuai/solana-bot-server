@@ -40,7 +40,6 @@ if (!process.env.SOLANA_RPC_ENDPOINT || !process.env.PRIVATE_KEY) {
   throw new Error('Missing env vars: SOLANA_RPC_ENDPOINT and PRIVATE_KEY must be set.');
 }
 const RPC_ENDPOINT: string = (process.env.SOLANA_RPC_ENDPOINT as string).trim();
-const BACKUP_RPC: string | undefined = process.env.SOLANA_RPC_ENDPOINT_BACKUP || undefined;
 const JUPITER_API_BASE = process.env.JUPITER_API_BASE || 'https://lite-api.jup.ag';
 
 const connection = new Connection(RPC_ENDPOINT, 'processed');
@@ -78,10 +77,10 @@ const SLIPPAGE_CAP_SELL_BPS = 300; // 3.00%
 const MIN_SOL_BUFFER = 0.01 * LAMPORTS_PER_SOL;
 
 // Retry/resign loop (avoid blockhash expiry)
-const RESEND_ROUNDS = 4;                             // rounds to try
-const ROUND_CONFIRM_TIMEOUT_MS = 6_000;              // per-round wait before re-signing
-const RESEND_DELAY_MS = 1_000;                       // small delay between rounds
-const FEE_MULTIPLIER_PER_ROUND = [1, 2, 3, 5];       // bump priority fee each round
+const RESEND_ROUNDS = 4;                       // rounds to try
+const ROUND_CONFIRM_TIMEOUT_MS = 6_000;        // per-round wait before re-signing
+const RESEND_DELAY_MS = 1_000;                 // small delay between rounds
+const FEE_MULTIPLIER_PER_ROUND = [1, 2, 3, 5]; // bump priority fee each round
 
 // Jito tips (optional via env)
 const JITO_TIP_ACCOUNT_LIST: string = (process.env.JITO_TIP_ACCOUNTS || '').trim();
@@ -120,7 +119,7 @@ const HELIUS_TIP_PUBKEYS: PublicKey[] = (() => {
 
 // Tip sizes (lamports). Helius tip default a bit higher to be clearly detected.
 const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS || 0) | 0;       // 0 = disabled
-const HELIUS_TIP_LAMPORTS = Number(process.env.HELIUS_TIP_LAMPORTS || 10_000);  // 0.00001 SOL
+const HELIUS_TIP_LAMPORTS = Number(process.env.HELIUS_TIP_LAMPORTS || 10_000);  // you set 1,000,000
 
 // ---------------------------------------------
 // ✅ Robust token-decimal resolver (multi-fallback)
@@ -479,7 +478,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     let finalSig: string | null = null;
 
     for (let round = 0; round < RESEND_ROUNDS; round++) {
-      const { blockhash: bh, lastValidBlockHeight: lvbh } = await connection.getLatestBlockhash('processed');
+      const { blockhash: bh } = await connection.getLatestBlockhash('processed');
 
       // Temp tx for base fee estimate
       const tempMsg = new TransactionMessage({
@@ -540,7 +539,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
             params: [rawTxBase64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
           }),
         })
-          .then(async (res) => {
+          .then(async (res: any) => {
             const text = await res.text();
             try {
               const json = JSON.parse(text);
