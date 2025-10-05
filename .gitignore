@@ -1,10 +1,16 @@
+cd /Users/luisbonilla/Desktop/solana-trading-V3/server
+
 cat > .gitignore <<'EOF'
 # dependencies
 node_modules/
+node_modules 2/
 
 # build output
 dist/
 coverage/
+
+# lockfiles (bad duplicates)
+package-lock 2.json
 
 # local env & secrets (NEVER COMMIT)
 .env
@@ -24,9 +30,3 @@ yarn-error.log*
 .idea/
 *.swp
 EOF
-.env
-service-account-key.json
-.env
-service-account-key.json
-.env
-service-account-key.json
