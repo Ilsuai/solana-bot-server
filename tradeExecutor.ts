@@ -522,7 +522,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       // RPC send
       const rpcPromise = connection
         .sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 })
-        .then((sig) => { console.log(`[RPC][Round ${round + 1}] Sig: ${sig}`); return sig; })
+        .then((sig: string) => { console.log(`[RPC][Round ${round + 1}] Sig: ${sig}`); return sig; })
         .catch((e: any) => { console.warn(`[RPC][Round ${round + 1}] Send failed: ${e?.message || e}`); throw e; });
       sendPromises.push(rpcPromise);
 

@@ -24,3 +24,5 @@ yarn-error.log*
 .idea/
 *.swp
 EOF
+.env
+service-account-key.json
