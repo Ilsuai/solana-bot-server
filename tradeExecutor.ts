@@ -393,7 +393,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const [
       tokenDecimals,
       solBalanceLamports,
-      { blockhash, lastValidBlockHeight },
+      { blockhash },
       needsAta,
       ataRentLamports,
     ] = await Promise.all([
