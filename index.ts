@@ -51,6 +51,8 @@ type NextgentPayload = {
     input_amount: number;
     input_symbol?: string;
     output_symbol?: string;
+    // note: Nextgent sometimes adds routes.isClosingTransaction on SELLs
+    // we won't type it strictly; we’ll read it via (data as any)
   };
 };
 
@@ -66,18 +68,28 @@ function requireSecret(req: Request, res: Response, next: NextFunction) {
   return res.status(401).json({ ok: false, error: 'Invalid shared secret' });
 }
 
-// Idempotency (ignore duplicate signal_id for a short window)
+// Idempotency: use a composite key so BUY and SELL of the same signal_id are distinct
 const IDEMP_TTL_MS = 10 * 60_000; // 10 minutes
-const seenSignals = new Map<string, number>();
+const seenKeys = new Map<string, number>();
 
-function isDuplicate(signalId: string) {
+function makeDedupKey(d: NextgentPayload['data']): string {
+  // BUY if paying SOL; otherwise SELL
+  const isBuy = d.input_mint === SOL_MINT && Number(d.input_amount) > 0;
+  const action: TradeAction = isBuy ? 'BUY' : 'SELL';
+  // Nextgent often marks closing leg
+  const closing = (d as any)?.routes?.isClosingTransaction ? 'close' : 'open';
+  // Distinguish direction by mints too
+  return `${d.signal_id}|${action}|${d.input_mint}->${d.output_mint}|${closing}`;
+}
+
+function isDuplicateKey(key: string) {
   const now = Date.now();
-  const prev = seenSignals.get(signalId);
+  const prev = seenKeys.get(key);
   if (prev && now - prev < IDEMP_TTL_MS) return true;
-  seenSignals.set(signalId, now);
+  seenKeys.set(key, now);
   // lazy purge
-  for (const [k, t] of seenSignals) {
-    if (now - t > IDEMP_TTL_MS) seenSignals.delete(k);
+  for (const [k, t] of seenKeys) {
+    if (now - t > IDEMP_TTL_MS) seenKeys.delete(k);
   }
   return false;
 }
@@ -172,8 +184,9 @@ app.post('/nexagent-signal', requireSecret, async (req: Request, res: Response) 
   console.log(`\n================== [SIGNAL ${data.signal_id} RECEIVED] ==================`);
   console.log('Full Payload:', JSON.stringify(payload, null, 2));
 
-  if (isDuplicate(data.signal_id)) {
-    console.log(`[Idempotency] Duplicate signal_id "${data.signal_id}" ignored.`);
+  const key = makeDedupKey(data);
+  if (isDuplicateKey(key)) {
+    console.log(`[Idempotency] Duplicate key "${key}" ignored.`);
     return res.json({ ok: true, deduped: true, signal_id: data.signal_id });
   }
 
