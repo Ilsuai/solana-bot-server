@@ -109,7 +109,7 @@ async function rpcHeartbeat(rpcUrl: string) {
       headers: { 'Content-Type': 'application/json' },
       body,
     });
-    const json = await res.json().catch(() => ({}));
+    const json: any = await res.json().catch(() => ({}));
     if (res.ok && json?.result === 'ok') {
       console.log(`[Heartbeat] RPC health ok @ ${new Date().toISOString()}`);
     } else {
@@ -147,7 +147,7 @@ app.get('/healthz', async (_req: Request, res: Response) => {
   }
   try {
     // Quick RPC ping via getHealth
-    const r = await fetch(RPC_URL, {
+    const r: any = await fetch(RPC_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
@@ -170,10 +170,7 @@ app.post('/nexagent-signal', requireSecret, async (req: Request, res: Response) 
   const data = payload.data;
 
   console.log(`\n================== [SIGNAL ${data.signal_id} RECEIVED] ==================`);
-  console.log(
-    'Full Payload:',
-    JSON.stringify(payload, null, 2)
-  );
+  console.log('Full Payload:', JSON.stringify(payload, null, 2));
 
   if (isDuplicate(data.signal_id)) {
     console.log(`[Idempotency] Duplicate signal_id "${data.signal_id}" ignored.`);
@@ -209,7 +206,7 @@ app.listen(PORT, async () => {
       const host = new URL(RPC_URL).host;
       console.log(`✅ CONNECTED TO RPC ENDPOINT: ${host}`);
     } catch {
-      console.log(`✅ CONNECTED TO RPC ENDPOINT: <configured>`);
+      console.log('✅ CONNECTED TO RPC ENDPOINT: <configured>');
     }
   } else {
     console.log('⚠️  RPC not configured.');
