@@ -1,19 +1,26 @@
-# Dependencies
-/node_modules
+cat > .gitignore <<'EOF'
+# dependencies
+node_modules/
 
-# Production build
-/dist
+# build output
+dist/
+coverage/
 
-# Environment variables
-.env
-
-# Secret Keys
-service-account-key.json
-# macOS
-.DS_Store
-node_modules
-dist
-build
+# local env & secrets (NEVER COMMIT)
 .env
 .env.*
+!.env.example
 service-account-key.json
+
+# logs & OS noise
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+
+# editor junk
+.vscode/
+.idea/
+*.swp
+EOF
