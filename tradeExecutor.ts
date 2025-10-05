@@ -119,7 +119,7 @@ const HELIUS_TIP_PUBKEYS: PublicKey[] = (() => {
 
 // Tip sizes (lamports). Helius tip default a bit higher to be clearly detected.
 const JITO_TIP_LAMPORTS = Number(process.env.JITO_TIP_LAMPORTS || 0) | 0;       // 0 = disabled
-const HELIUS_TIP_LAMPORTS = Number(process.env.HELIUS_TIP_LAMPORTS || 10_000);  // you set 1,000,000
+const HELIUS_TIP_LAMPORTS = Number(process.env.HELIUS_TIP_LAMPORTS || 10_000);  // you can set 1,000,000
 
 // ---------------------------------------------
 // ✅ Robust token-decimal resolver (multi-fallback)
@@ -393,7 +393,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     const [
       tokenDecimals,
       solBalanceLamports,
-      { blockhash, lastValidBlockHeight },
+      { blockhash },
       needsAta,
       ataRentLamports,
     ] = await Promise.all([
@@ -522,7 +522,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
       // RPC send
       const rpcPromise = connection
         .sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 })
-        .then((sig) => { console.log(`[RPC][Round ${round + 1}] Sig: ${sig}`); return sig; })
+        .then((sig: string) => { console.log(`[RPC][Round ${round + 1}] Sig: ${sig}`); return sig; })
         .catch((e: any) => { console.warn(`[RPC][Round ${round + 1}] Send failed: ${e?.message || e}`); throw e; });
       sendPromises.push(rpcPromise);
 
@@ -539,7 +539,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
             params: [rawTxBase64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
           }),
         })
-          .then(async (res: any) => {
+          .then(async (res: any) => {        // <— typed here
             const text = await res.text();
             try {
               const json = JSON.parse(text);
@@ -593,8 +593,8 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
     // Log amounts: BUY logs intended SOL spent from quote.inAmount; SELL logs SOL received from quote.outAmount
     const solAmountForLog =
       action === 'BUY'
-        ? Number(quote.inAmount) / LAMPORTS_PER_SOL
-        : Number(quote.outAmount) / LAMPORTS_PER_SOL;
+        ? Number((quote as any).inAmount ?? 0) / LAMPORTS_PER_SOL
+        : Number((quote as any).outAmount ?? 0) / LAMPORTS_PER_SOL;
 
     if (action === 'BUY') {
       await managePosition({
@@ -604,7 +604,7 @@ export async function executeTradeFromSignal(signal: TradeSignal) {
         tokenAddress: output_mint,
         tokenSymbol: symbolForLogs,
         solAmount: solAmountForLog,
-        tokenReceived: Number(quote.outAmount) / 10 ** (await getTokenDecimals(output_mint)),
+        tokenReceived: Number((quote as any).outAmount ?? 0) / 10 ** (await getTokenDecimals(output_mint)),
         txid: finalSig,
       });
     } else {

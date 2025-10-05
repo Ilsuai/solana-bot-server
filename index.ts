@@ -1,180 +1,226 @@
-// ✅ Load .env first
-import 'dotenv/config';
-
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-// @ts-ignore
+// @ts-ignore - node-fetch types not required
 import fetch from 'node-fetch';
-import { executeTradeFromSignal, TradeSignal } from './tradeExecutor';
+import { Connection } from '@solana/web3.js';
 
-// ✅ Use our pre-initialized Firebase exports
-import { db } from './firebaseAdmin';
+// Init firebase on import (your file already logs ready/initialized)
+import './firebaseAdmin';
 
+import { executeTradeFromSignal } from './tradeExecutor';
+
+// ------------------------------
+// Config / constants
+// ------------------------------
 const PORT = Number(process.env.PORT || 3001);
-const RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || '';
+const RPC_URL = process.env.SOLANA_RPC_ENDPOINT;
 const SHARED_SECRET = process.env.NEXAGENT_SHARED_SECRET || '';
+
+if (!RPC_URL) {
+  // Keep this non-fatal so /healthz can still respond, but warn loudly.
+  console.warn('⚠️  SOLANA_RPC_ENDPOINT is not set. /healthz and trading may not function.');
+}
+
+const HEARTBEAT_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS ?? 60_000); // 60s default
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// ---------- Small helpers ----------
-async function rpcHealth(endpoint: string): Promise<'ok' | 'unhealthy'> {
+// Keep a connection around for health checks (trade logic uses its own)
+const connection = RPC_URL ? new Connection(RPC_URL, 'confirmed') : undefined;
+
+// ------------------------------
+// Types
+// ------------------------------
+type TradeAction = 'BUY' | 'SELL';
+
+export type TradeSignal = {
+  action: TradeAction;
+  signal_id: string;
+  input_mint: string;
+  output_mint: string;
+  input_amount: number; // for BUY: SOL amount; for SELL: ignored if you auto-sell wallet balance
+  symbol?: string;
+};
+
+// The incoming webhook payload shape you’re using
+type NextgentPayload = {
+  data: {
+    signal_id: string;
+    transaction_type: 'swap';
+    input_mint: string;
+    output_mint: string;
+    input_amount: number;
+    input_symbol?: string;
+    output_symbol?: string;
+  };
+};
+
+// ------------------------------
+// Small helpers
+// ------------------------------
+
+// Strict secret check (optional: if env var empty, we allow all)
+function requireSecret(req: Request, res: Response, next: NextFunction) {
+  if (!SHARED_SECRET) return next(); // no secret required
+  const header = req.header('x-nexagent-secret');
+  if (header && header === SHARED_SECRET) return next();
+  return res.status(401).json({ ok: false, error: 'Invalid shared secret' });
+}
+
+// Idempotency (ignore duplicate signal_id for a short window)
+const IDEMP_TTL_MS = 10 * 60_000; // 10 minutes
+const seenSignals = new Map<string, number>();
+
+function isDuplicate(signalId: string) {
+  const now = Date.now();
+  const prev = seenSignals.get(signalId);
+  if (prev && now - prev < IDEMP_TTL_MS) return true;
+  seenSignals.set(signalId, now);
+  // lazy purge
+  for (const [k, t] of seenSignals) {
+    if (now - t > IDEMP_TTL_MS) seenSignals.delete(k);
+  }
+  return false;
+}
+
+// Decide BUY vs SELL and fill signal object
+function buildTradeSignal(p: NextgentPayload['data']): TradeSignal {
+  // convention: if paying SOL (input_mint == SOL, input_amount > 0) => BUY
+  const isBuy = p.input_mint === SOL_MINT && Number(p.input_amount) > 0;
+
+  const action: TradeAction = isBuy ? 'BUY' : 'SELL';
+  const symbol = isBuy ? p.output_symbol : p.input_symbol;
+
+  return {
+    action,
+    signal_id: p.signal_id,
+    input_mint: p.input_mint,
+    output_mint: p.output_mint,
+    input_amount: Number(p.input_amount) || 0,
+    symbol,
+  };
+}
+
+// Heartbeat (periodic) — prints logs to Render so you can see steady activity
+async function rpcHeartbeat(rpcUrl: string) {
   try {
-    const r = await fetch(endpoint, {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' });
+    const res = await fetch(rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+      body,
     });
-    const j = await r.json();
-    return j?.result === 'ok' ? 'ok' : 'unhealthy';
-  } catch {
-    return 'unhealthy';
-  }
-}
-
-// Create a Firestore doc ONLY if it does not exist yet (idempotency)
-async function tryClaimSignal(signalId: string): Promise<boolean> {
-  const ref = db.collection('signals').doc(signalId);
-  try {
-    await ref.create({
-      status: 'received',
-      createdAt: new Date(),
-    });
-    return true; // we are the first
-  } catch (e: any) {
-    if (String(e?.code) === '6' || /already exists/i.test(String(e?.message))) {
-      return false; // someone already created it
+    const json: any = await res.json().catch(() => ({}));
+    if (res.ok && json?.result === 'ok') {
+      console.log(`[Heartbeat] RPC health ok @ ${new Date().toISOString()}`);
+    } else {
+      console.warn(
+        `[Heartbeat] RPC health not-ok (${res.status}) @ ${new Date().toISOString()}:`,
+        json?.error || json
+      );
     }
-    throw e; // unexpected Firestore error
+  } catch (e: any) {
+    console.warn(
+      `[Heartbeat] RPC health failed @ ${new Date().toISOString()}: ${e?.message || e}`
+    );
   }
 }
 
-async function markSignalStatus(signalId: string, data: Record<string, any>) {
-  const ref = db.collection('signals').doc(signalId);
-  await ref.set({ ...data, updatedAt: new Date() }, { merge: true });
+function startHeartbeat(rpcUrl?: string) {
+  if (!rpcUrl) return;
+  // fire immediately on boot
+  rpcHeartbeat(rpcUrl);
+  // and repeat
+  setInterval(() => rpcHeartbeat(rpcUrl), HEARTBEAT_INTERVAL_MS);
 }
 
-// Normalize Nextgent payload
-function extractPayload(body: any): any {
-  return body?.data ?? body;
-}
-
-// Heuristic to determine action if not provided
-function inferAction(p: any): 'BUY' | 'SELL' {
-  if (typeof p.action === 'string') {
-    const a = p.action.toUpperCase();
-    if (a === 'BUY' || a === 'SELL') return a as 'BUY' | 'SELL';
-  }
-  if (p.input_mint === SOL_MINT) return 'BUY';
-  if (p.output_mint === SOL_MINT) return 'SELL';
-  return 'BUY';
-}
-
-// ---------- Server ----------
+// ------------------------------
+// App setup
+// ------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/healthz', async (_req, res) => {
-  const health = RPC_ENDPOINT ? await rpcHealth(RPC_ENDPOINT) : 'unhealthy';
-  res.json({ ok: true, rpc: health });
+// Health — used by your Render health checks and for manual curl
+app.get('/healthz', async (_req: Request, res: Response) => {
+  if (!connection || !RPC_URL) {
+    return res.status(500).json({ ok: false, rpc: 'missing' });
+  }
+  try {
+    // Quick RPC ping via getHealth
+    const r: any = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+    }).then((r: any) => r.json());
+    const ok = r?.result === 'ok';
+    return res.status(ok ? 200 : 500).json({ ok, rpc: ok ? 'ok' : 'degraded' });
+  } catch {
+    return res.status(500).json({ ok: false, rpc: 'error' });
+  }
 });
 
-(async () => {
+// Main webhook — Nextgent.ai -> your bot
+app.post('/nexagent-signal', requireSecret, async (req: Request, res: Response) => {
+  const payload = req.body as NextgentPayload;
+
+  if (!payload?.data) {
+    return res.status(400).json({ ok: false, error: 'Missing data payload' });
+  }
+
+  const data = payload.data;
+
+  console.log(`\n================== [SIGNAL ${data.signal_id} RECEIVED] ==================`);
+  console.log('Full Payload:', JSON.stringify(payload, null, 2));
+
+  if (isDuplicate(data.signal_id)) {
+    console.log(`[Idempotency] Duplicate signal_id "${data.signal_id}" ignored.`);
+    return res.json({ ok: true, deduped: true, signal_id: data.signal_id });
+  }
+
+  // Build normalized signal and kick off trade
+  const signal = buildTradeSignal(data);
+
+  // Respond immediately; the trading pipeline logs details & writes to Firestore
+  res.json({ ok: true, accepted: true, signal_id: data.signal_id });
+
+  // Fire-and-forget
+  try {
+    await executeTradeFromSignal(signal);
+  } catch (e: any) {
+    // tradeExecutor handles its own logging; this is just a guard
+    console.error(`[Signal Error] ${data.signal_id}:`, e?.message || e);
+  }
+});
+
+// ------------------------------
+// Start server
+// ------------------------------
+app.listen(PORT, async () => {
   console.log('==================================================');
   console.log('  Solana Trading Bot - Starting Up');
   console.log('==================================================');
 
-  if (!RPC_ENDPOINT) {
-    console.warn('⚠️  SOLANA_RPC_ENDPOINT not set.');
-  } else {
-    const h = await rpcHealth(RPC_ENDPOINT);
-    if (h === 'ok') {
-      try {
-        const host = new URL(RPC_ENDPOINT).host;
-        console.log(`✅ CONNECTED TO RPC ENDPOINT: ${host}`);
-      } catch {
-        console.log(`✅ RPC health OK`);
-      }
-    } else {
-      console.warn('⚠️  RPC health check failed');
+  if (RPC_URL) {
+    try {
+      // quick version: just print host
+      const host = new URL(RPC_URL).host;
+      console.log(`✅ CONNECTED TO RPC ENDPOINT: ${host}`);
+    } catch {
+      console.log('✅ CONNECTED TO RPC ENDPOINT: <configured>');
     }
+  } else {
+    console.log('⚠️  RPC not configured.');
   }
 
-  if (!SHARED_SECRET) {
-    console.warn('⚠️  NEXAGENT_SHARED_SECRET not set. Webhook auth is DISABLED!');
-  } else {
+  if (SHARED_SECRET) {
     console.log('✅ Webhook shared secret configured.');
+  } else {
+    console.log('⚠️  Webhook shared secret is NOT set; endpoint is open.');
   }
 
   console.log('--------------------------------------------------');
-  console.log('✅ Firebase Admin SDK ready via firebaseAdmin.ts');
-})().catch((e) => console.error('Boot error:', e));
-
-app.post('/nexagent-signal', async (req, res) => {
-  const payload = extractPayload(req.body);
-  const signal_id = String(payload.signal_id || '').trim();
-
-  console.log(`\n================== [SIGNAL ${signal_id || 'UNKNOWN'} RECEIVED] ==================`);
-  console.log('Full Payload:', JSON.stringify({ data: payload }, null, 2));
-
-  // 1) Shared-secret auth
-  if (SHARED_SECRET) {
-    const headerSecret = String(req.header('x-nexagent-secret') || '');
-    if (!headerSecret || headerSecret !== SHARED_SECRET) {
-      console.warn('[Auth] Missing or invalid x-nexagent-secret.');
-      return res.status(401).json({ ok: false, error: 'Unauthorized' });
-    }
-  }
-
-  // 2) Basic validation
-  if (!signal_id) return res.status(400).json({ ok: false, error: 'Missing signal_id' });
-  if (!payload.input_mint || !payload.output_mint) {
-    return res.status(400).json({ ok: false, error: 'Missing input_mint/output_mint' });
-  }
-  const input_amount = Number(payload.input_amount ?? 0);
-  if (Number.isNaN(input_amount) || input_amount < 0) {
-    return res.status(400).json({ ok: false, error: 'Invalid input_amount' });
-  }
-
-  // 3) Idempotency
-  let claimed = false;
-  try {
-    claimed = await tryClaimSignal(signal_id);
-  } catch (e: any) {
-    console.error('[Idempotency] Firestore error:', e?.message || e);
-    return res.status(500).json({ ok: false, error: 'Idempotency store error' });
-  }
-  if (!claimed) {
-    console.log(`[Idempotency] Duplicate signal_id "${signal_id}" ignored.`);
-    return res.status(200).json({ ok: true, status: 'ignored_duplicate' });
-  }
-
-  // 4) Build TradeSignal
-  const action = inferAction(payload);
-  const tradeSignal: TradeSignal = {
-    action,
-    signal_id,
-    input_mint: String(payload.input_mint),
-    output_mint: String(payload.output_mint),
-    input_amount: input_amount,
-    symbol: payload.symbol,
-    input_symbol: payload.input_symbol,
-    output_symbol: payload.output_symbol,
-  };
-
-  // 5) Execute
-  try {
-    await markSignalStatus(signal_id, { status: 'processing', action });
-    await executeTradeFromSignal(tradeSignal);
-    await markSignalStatus(signal_id, { status: 'done', action });
-    return res.status(200).json({ ok: true, status: 'executed' });
-  } catch (e: any) {
-    console.error('[Execute] Error:', e?.message || e);
-    await markSignalStatus(signal_id, { status: 'failed', action, error: e?.message || String(e) });
-    return res.status(500).json({ ok: false, error: e?.message || 'Execution failed' });
-  }
-});
-
-app.listen(PORT, () => {
   console.log(`✅ Server is running and listening on port ${PORT}`);
-  console.log('[Warmup] Ping successful to global sender. Connection is warm.');
+
+  // start periodic heartbeat so you see logs in Render regularly
+  startHeartbeat(RPC_URL);
 });
