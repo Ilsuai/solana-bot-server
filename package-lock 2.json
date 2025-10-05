@@ -1,18 +1,16 @@
 {
   "name": "solana-trading-bot-server",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "solana-trading-bot-server",
-      "version": "1.0.1",
+      "version": "1.0.0",
       "dependencies": {
         "@jup-ag/api": "^6.0.44",
         "@solana/spl-token": "^0.4.14",
         "@solana/web3.js": "^1.98.4",
-        "abort-controller": "3.0.0",
-        "bigint-buffer": "1.1.5",
         "bs58": "^5.0.0",
         "cors": "^2.8.5",
         "dotenv": "^16.6.1",
@@ -789,9 +787,9 @@
       "license": "MIT"
     },
     "node_modules/@types/node": {
-      "version": "20.19.19",
-      "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.19.tgz",
-      "integrity": "sha512-pb1Uqj5WJP7wrcbLU7Ru4QtA0+3kAXrkutGiD26wUKzSMgNNaPARTUDQmElUXp64kh3cWdou3Q0C7qwwxqSFmg==",
+      "version": "20.19.18",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.18.tgz",
+      "integrity": "sha512-KeYVbfnbsBCyKG8e3gmUqAfyZNcoj/qpEbHRkQkfZdKOBrU7QQ+BsTdfqLSWX9/m1ytYreMhpKvp+EZi3UFYAg==",
       "license": "MIT",
       "dependencies": {
         "undici-types": "~6.21.0"
@@ -823,26 +821,6 @@
       }
     },
     "node_modules/@types/send": {
-      "version": "1.2.0",
-      "resolved": "https://registry.npmjs.org/@types/send/-/send-1.2.0.tgz",
-      "integrity": "sha512-zBF6vZJn1IaMpg3xUF25VK3gd3l8zwE0ZLRX7dsQyQi+jp4E8mMDJNGDYnYse+bQhYwWERTxVwHpi3dMOq7RKQ==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/node": "*"
-      }
-    },
-    "node_modules/@types/serve-static": {
-      "version": "1.15.9",
-      "resolved": "https://registry.npmjs.org/@types/serve-static/-/serve-static-1.15.9.tgz",
-      "integrity": "sha512-dOTIuqpWLyl3BBXU3maNQsS4A3zuuoYRNIvYSxxhebPfXg2mzWQEPne/nlJ37yOse6uGgR386uTpdsx4D0QZWA==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/http-errors": "*",
-        "@types/node": "*",
-        "@types/send": "<1"
-      }
-    },
-    "node_modules/@types/serve-static/node_modules/@types/send": {
       "version": "0.17.5",
       "resolved": "https://registry.npmjs.org/@types/send/-/send-0.17.5.tgz",
       "integrity": "sha512-z6F2D3cOStZvuk2SaP6YrwkNO65iTZcwA2ZkSABegdkAh/lf+Aa/YQndZVfmEXT5vgAp6zv06VQ3ejSVjAny4w==",
@@ -850,6 +828,17 @@
       "dependencies": {
         "@types/mime": "^1",
         "@types/node": "*"
+      }
+    },
+    "node_modules/@types/serve-static": {
+      "version": "1.15.8",
+      "resolved": "https://registry.npmjs.org/@types/serve-static/-/serve-static-1.15.8.tgz",
+      "integrity": "sha512-roei0UY3LhpOJvjbIP6ZZFngyLKl5dskOtDhxY5THRSpO+ZI+nzJ+m5yUMzGrp89YRa7lvknKkMYjqQFGwA7Sg==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/http-errors": "*",
+        "@types/node": "*",
+        "@types/send": "*"
       }
     },
     "node_modules/@types/tough-cookie": {
@@ -879,6 +868,7 @@
       "resolved": "https://registry.npmjs.org/abort-controller/-/abort-controller-3.0.0.tgz",
       "integrity": "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==",
       "license": "MIT",
+      "optional": true,
       "dependencies": {
         "event-target-shim": "^5.0.0"
       },
@@ -1616,6 +1606,7 @@
       "resolved": "https://registry.npmjs.org/event-target-shim/-/event-target-shim-5.0.1.tgz",
       "integrity": "sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==",
       "license": "MIT",
+      "optional": true,
       "engines": {
         "node": ">=6"
       }
@@ -1809,9 +1800,9 @@
       }
     },
     "node_modules/firebase-admin/node_modules/@types/node": {
-      "version": "22.18.8",
-      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.18.8.tgz",
-      "integrity": "sha512-pAZSHMiagDR7cARo/cch1f3rXy0AEXwsVsVH09FcyeJVAzCnGgmYis7P3JidtTUjyadhTeSo8TgRPswstghDaw==",
+      "version": "22.18.7",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.18.7.tgz",
+      "integrity": "sha512-3E97nlWEVp2V6J7aMkR8eOnw/w0pArPwf/5/W0865f+xzBoGL/ZuHkTAKAGN7cOWNwd+sG+hZOqj+fjzeHS75g==",
       "license": "MIT",
       "dependencies": {
         "undici-types": "~6.21.0"
@@ -3661,9 +3652,9 @@
       }
     },
     "node_modules/typescript": {
-      "version": "5.9.3",
-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
-      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+      "version": "5.9.2",
+      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.2.tgz",
+      "integrity": "sha512-CWBzXQrc/qOkhidw1OzBTQuYRbfyxDXJMVJ1XNwUHGROVmuaeiEm3OslpZ1RV96d7SKKjZKrSJu3+t/xlw3R9A==",
       "license": "Apache-2.0",
       "bin": {
         "tsc": "bin/tsc",
